@@ -39,6 +39,7 @@ class SemanticOffloadingManager(CPUOffloadingManager):
         chain_aware: bool = False,
         session_aware: bool = False,
         session_bonus_half_life: int = 0,
+        method: str = _DEFAULT_METHOD,
     ) -> None:
         super().__init__(
             num_blocks=num_blocks,
@@ -54,7 +55,7 @@ class SemanticOffloadingManager(CPUOffloadingManager):
         self._policy = SemanticPolicy(
             cache_capacity=num_blocks,
             relevance_ema=self.relevance_ema,
-            method=_DEFAULT_METHOD,
+            method=method,
             alpha=_DEFAULT_ALPHA,
             grace_window_blocks=grace_window_blocks,
             mode=eviction_mode,

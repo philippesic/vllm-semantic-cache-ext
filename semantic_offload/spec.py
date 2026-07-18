@@ -31,6 +31,11 @@ class SemanticOffloadingSpec(CPUOffloadingSpec):
             max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
             grace_window_blocks = int(self.extra_config.get("grace_window_blocks", 0))
             eviction_mode = str(self.extra_config.get("eviction_mode", "blend"))
+            # Step 1.6's benchmark grid needs {minmax, mean, cuboid_mean} as
+            # separate, selectable configs -- previously hardcoded to
+            # manager.py's _DEFAULT_METHOD with no way to pick another at
+            # launch time (issues log entry #34).
+            method = str(self.extra_config.get("method", "minmax"))
             self._manager = SemanticOffloadingManager(
                 num_blocks=self.num_blocks,
                 enable_events=self.kv_events_config.enable_kv_cache_events,
@@ -38,5 +43,6 @@ class SemanticOffloadingSpec(CPUOffloadingSpec):
                 max_tracker_size=max_tracker_size,
                 grace_window_blocks=grace_window_blocks,
                 eviction_mode=eviction_mode,
+                method=method,
             )
         return self._manager

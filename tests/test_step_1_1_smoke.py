@@ -33,7 +33,9 @@ from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 # ---------------------------------------------------------------------------
 
 
-def _make_vllm_config(cpu_bytes_to_use: int = 65536):
+def _make_vllm_config(
+    cpu_bytes_to_use: int = 65536, extra_config_overrides: dict | None = None
+):
     from vllm.config import (
         CacheConfig,
         DeviceConfig,
@@ -62,14 +64,16 @@ def _make_vllm_config(cpu_bytes_to_use: int = 65536):
         cache_dtype="auto",
         enable_prefix_caching=True,
     )
+    extra_config = {
+        "spec_name": "SemanticOffloadingSpec",
+        "spec_module_path": "semantic_offload.spec",
+        "cpu_bytes_to_use": cpu_bytes_to_use,
+    }
+    extra_config.update(extra_config_overrides or {})
     kv_transfer_config = KVTransferConfig(
         kv_connector="OffloadingConnector",
         kv_role="kv_both",
-        kv_connector_extra_config={
-            "spec_name": "SemanticOffloadingSpec",
-            "spec_module_path": "semantic_offload.spec",
-            "cpu_bytes_to_use": cpu_bytes_to_use,
-        },
+        kv_connector_extra_config=extra_config,
     )
     return VllmConfig(
         scheduler_config=scheduler_config,
@@ -139,6 +143,20 @@ def test_spec_constructs_end_to_end_and_serves_manager():
     assert spec.get_manager() is manager
 
 
+def test_spec_extra_config_method_selects_real_scoring_method():
+    """issues log entry #34: `method` must be selectable via
+    kv_connector_extra_config (the same real launch-config path every other
+    knob here uses), not just at the Python-constructor level -- this is
+    what Step 1.6's benchmark grid actually launches servers with."""
+    config = _make_vllm_config(extra_config_overrides={"method": "cuboid_mean"})
+    kv_cache_config = _make_kv_cache_config()
+    spec = OffloadingSpecFactory.create_spec(config, kv_cache_config)
+
+    manager = spec.get_manager()
+
+    assert manager._policy._method == "cuboid_mean"
+
+
 # ---------------------------------------------------------------------------
 # 2. Behavior identical to plain LRU (Step 1.1's pass-through requirement)
 # ---------------------------------------------------------------------------
@@ -174,6 +192,21 @@ def test_semantic_manager_matches_lru_manager_behavior():
 
     assert semantic_evicted == lru_evicted
     assert semantic_evicted is not None
+
+
+def test_semantic_manager_method_is_selectable():
+    """issues log entry #34: `method` used to be hardcoded to
+    manager.py's _DEFAULT_METHOD with no way to select a different scoring
+    method at construction time -- Step 1.6's benchmark grid needs
+    {minmax, mean, cuboid_mean} as separate, runnable configs, so this must
+    actually thread through to the real SemanticPolicy instance."""
+    default_manager = SemanticOffloadingManager(num_blocks=4)
+    mean_manager = SemanticOffloadingManager(num_blocks=4, method="mean")
+    cuboid_manager = SemanticOffloadingManager(num_blocks=4, method="cuboid_mean")
+
+    assert default_manager._policy._method == "minmax"
+    assert mean_manager._policy._method == "mean"
+    assert cuboid_manager._policy._method == "cuboid_mean"
 
 
 # ---------------------------------------------------------------------------

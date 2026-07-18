@@ -183,6 +183,8 @@ def _make_connector_scheduler(
     sched._prefetched = {}
     sched._prefetch_reserved_blocks = 0
     sched._preempted_pending = set()
+    sched._preempted_at = {}
+    sched._retry_attempts = {}
     sched._req_status = {}
     sched._current_batch_load_jobs = {}
     sched._current_batch_prefetch_load_jobs = {}

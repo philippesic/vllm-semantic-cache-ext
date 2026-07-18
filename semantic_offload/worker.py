@@ -59,6 +59,13 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 
 _SCORING_METHODS = ("minmax", "mean", "cuboid_mean")
+# Which BlockSummary fields each method's batched scorer actually needs --
+# only these get stacked into the cache, not all four.
+_METHOD_FIELDS = {
+    "minmax": ("max", "min"),
+    "mean": ("mean",),
+    "cuboid_mean": ("mean", "mad"),
+}
 
 
 class SemanticOffloadingWorker(CPUOffloadingWorker):
@@ -112,6 +119,16 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         self.durable_summaries: dict[OffloadKey, list[BlockSummary]] = {}
         self._pending_job_keys: dict[int, list[OffloadKey]] = {}
         self._pending_scores: dict[str, dict[str, list[tuple[OffloadKey, float]]]] = {}
+        # Cache of durable_summaries stacked into batched tensors, rebuilt
+        # only when new entries are added (_durably_key_summaries sets the
+        # dirty flag) instead of on every query capture -- query captures
+        # fire on nearly every prefill/mixed step, while insertions happen
+        # far less often, so rebuilding fresh each time was itself a real
+        # Python-level O(n_candidates) cost even after the scoring math
+        # itself was vectorized (issues log entry #53's follow-up).
+        self._stack_cache_dirty = True
+        self._stack_cache_keys: list[OffloadKey] = []
+        self._stack_cache: dict[str, torch.Tensor] = {}
         self._query_capture_mode = None
         if self._probe_layer_name is not None:
             probe_layer = self._attention_layers[self._probe_layer_name]
@@ -139,6 +156,26 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         scores = self._pending_scores
         self._pending_scores = {}
         return scores
+
+    def _rebuild_stack_cache(self) -> None:
+        """Stack every resident candidate's summaries (only the fields
+        `self._method` actually needs) into batched tensors once, cached
+        until the next insertion. See the dirty-flag comment in __init__
+        for why this is cached rather than rebuilt on every query capture."""
+        keys = list(self.durable_summaries.keys())
+        summary_lists = list(self.durable_summaries.values())
+        cache: dict[str, torch.Tensor] = {}
+        for field in _METHOD_FIELDS[self._method]:
+            # [n_candidates, num_kv_heads, head_dim]
+            cache[field] = torch.stack(
+                [
+                    torch.stack([getattr(s, field) for s in summary_list])
+                    for summary_list in summary_lists
+                ]
+            )
+        self._stack_cache_keys = keys
+        self._stack_cache = cache
+        self._stack_cache_dirty = False
 
     def _on_query_captured(self, req_id: str, query_repr: torch.Tensor) -> None:
         if not self.durable_summaries:
@@ -170,30 +207,26 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         # per-candidate-sync design turned multi-second per query capture,
         # showing up as catastrophic TTFT with completely normal ITL (the
         # ongoing-decode path never touches this code) -- found via a real
-        # B200 calibration run, not assumed. Fix: stack every candidate's
-        # summaries into batched tensors and score the whole pool in one
-        # vectorized pass, one sync total instead of one per candidate.
-        keys = list(self.durable_summaries.keys())
-        summary_lists = list(self.durable_summaries.values())
-
-        def stack_field(field: str) -> torch.Tensor:
-            # [n_candidates, num_kv_heads, head_dim]
-            return torch.stack(
-                [
-                    torch.stack([getattr(s, field) for s in summary_list])
-                    for summary_list in summary_lists
-                ]
-            )
+        # B200 calibration run, not assumed. Fixed by scoring the whole
+        # pool as one vectorized pass (one sync total instead of one per
+        # candidate) -- and, since even the batched version still measured
+        # a large TTFT gap on a real B200 retest, by caching the stacked
+        # tensors themselves (_rebuild_stack_cache) so rebuilding them from
+        # the durable_summaries dict -- itself a real Python-level cost at
+        # thousands of candidates -- only happens on actual insertions, not
+        # on every query capture.
+        if self._stack_cache_dirty:
+            self._rebuild_stack_cache()
+        keys = self._stack_cache_keys
+        cache = self._stack_cache
 
         query = query_repr.unsqueeze(0)  # [1, num_kv_heads, head_dim]
         if self._method == "minmax":
-            per_head = score_minmax_batch(query, stack_field("max"), stack_field("min"))
+            per_head = score_minmax_batch(query, cache["max"], cache["min"])
         elif self._method == "mean":
-            per_head = score_mean_batch(query, stack_field("mean"))
+            per_head = score_mean_batch(query, cache["mean"])
         else:  # cuboid_mean
-            per_head = score_cuboid_mean_batch(
-                query, stack_field("mean"), stack_field("mad")
-            )
+            per_head = score_cuboid_mean_batch(query, cache["mean"], cache["mad"])
         # Per-head score, combined via max across heads -- different KV
         # heads may specialize on different content, so the head most
         # aligned with this query should drive the block's relevance
@@ -290,6 +323,7 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
             # proxy for all of its keys rather than dropping the signal.
             for key in keys:
                 self.durable_summaries[key] = block_summaries[-1]
+        self._stack_cache_dirty = True
 
     def submit_store(
         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec

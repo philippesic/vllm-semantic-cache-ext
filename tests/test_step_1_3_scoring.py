@@ -23,6 +23,9 @@ def _make_worker(method: str = "minmax") -> SemanticOffloadingWorker:
     worker.durable_summaries = {}
     worker._pending_scores = {}
     worker._method = method
+    worker._stack_cache_dirty = True
+    worker._stack_cache_keys = []
+    worker._stack_cache = {}
     return worker
 
 
@@ -149,6 +152,39 @@ def test_batched_scoring_matches_scalar_scoring_per_candidate():
         assert set(batched_ranked) == set(scalar_scores)
         for key in keys:
             assert batched_ranked[key] == pytest.approx(scalar_scores[key], abs=1e-4)
+
+
+def test_stack_cache_invalidates_on_new_insertion():
+    """Correctness of the caching optimization itself (entry #53's follow-
+    up): a block stored AFTER the stack cache was already built must still
+    show up in scoring on the next query capture -- not silently missing
+    because the cache went stale. This is the real risk a caching layer
+    introduces; performance is worthless if it breaks this."""
+    worker = _make_worker(method="minmax")
+    worker.summaries["layer0"][1] = [_summary(1.0)]
+    key1 = to_key(1)
+    worker.receive_job_keys({1: [key1]})
+    worker._durably_key_summaries(1, [1])
+    assert worker._stack_cache_dirty is True  # insertion marks it dirty
+
+    query = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
+    worker._on_query_captured("req-1", query)
+    assert worker._stack_cache_dirty is False  # rebuilt on the query
+    first_scores = worker.pop_pending_scores()["minmax"]["req-1"]
+    assert {k for k, _ in first_scores} == {key1}
+
+    # A new block, stored after the cache was already built and used once.
+    worker.summaries["layer0"][2] = [_summary(2.0)]
+    key2 = to_key(2)
+    worker.receive_job_keys({2: [key2]})
+    worker._durably_key_summaries(2, [2])
+    assert worker._stack_cache_dirty is True  # invalidated by the insertion
+
+    worker._on_query_captured("req-2", query)
+    second_scores = worker.pop_pending_scores()["minmax"]["req-2"]
+    assert {k for k, _ in second_scores} == {key1, key2}, (
+        "newly-stored block missing from scoring -- stale cache bug"
+    )
 
 
 def test_manager_update_relevance_ema():

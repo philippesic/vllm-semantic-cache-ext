@@ -11,11 +11,12 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
-from harness import metrics, needle_workload, policies, workloads
+from harness import adaptive_splice_probe, metrics, needle_workload, policies, workloads
 
 
 def test_kv_transfer_config_lru_uses_stock_offloading_connector():
@@ -220,3 +221,108 @@ def test_grid_sweep_cell_args_use_num_prompts_when_no_duration_given():
     assert "--num-prompts" in args and args[args.index("--num-prompts") + 1] == "20"
     assert "--target-duration-s" not in args
     assert "--num-gpu-blocks-override" not in args
+
+
+def _write_lines(path, lines):
+    with open(path, "a") as f:
+        for line in lines:
+            f.write(line + "\n")
+            f.flush()
+
+
+def _watch_in_background(log_path, tag, timeout_s=5.0):
+    import threading
+
+    holder = {}
+
+    def target():
+        holder["result"] = adaptive_splice_probe.watch_for_splice(
+            str(log_path), tag, timeout_s=timeout_s, poll_interval_s=0.05
+        )
+
+    thread = threading.Thread(target=target)
+    thread.start()
+    time.sleep(0.2)  # let watch_for_splice open the file and seek to end first
+    return thread, holder
+
+
+def test_watch_for_splice_matches_partial_splice_with_spliced_ge_1(tmp_path):
+    """Simulates real live tailing: the watch must already be running
+    (seeked to the file's current end) before the matching line is
+    appended -- writing the line first and watching after (as an earlier,
+    buggy version of this test did) doesn't exercise real behavior at all,
+    since seek(0, 2) skips content that already existed."""
+    log_path = tmp_path / "server.log"
+    log_path.write_text("")
+    thread, holder = _watch_in_background(log_path, "TAG123")
+    _write_lines(
+        log_path,
+        [
+            "PREFETCH_EFFECT_DEBUG cmpl-other-req-0-abc: PARTIAL SPLICE spliced=2 reloaded=1 covered=0.67",
+            "PREFETCH_EFFECT_DEBUG cmpl-TAG123-0-xyz: PARTIAL SPLICE spliced=1 reloaded=3 covered=0.25",
+        ],
+    )
+    thread.join(timeout=5.0)
+    result = holder["result"]
+    assert result is not None
+    assert result["req_id"] == "cmpl-TAG123-0-xyz"
+    assert result["spliced"] == 1
+
+
+def test_watch_for_splice_ignores_zero_spliced_key_mismatch_lines(tmp_path):
+    log_path = tmp_path / "server.log"
+    log_path.write_text("")
+    _write_lines(
+        log_path,
+        [
+            "PREFETCH_EFFECT_DEBUG cmpl-TAG123-0-xyz: KEY MISMATCH spliced=0 keys_to_load=5 prefetch.keys=5",
+        ],
+    )
+    result = adaptive_splice_probe.watch_for_splice(
+        str(log_path), "TAG123", timeout_s=1.0, poll_interval_s=0.05
+    )
+    assert result is None
+
+
+def test_watch_for_splice_matches_legacy_unconditional_spliced_marker(tmp_path):
+    log_path = tmp_path / "server.log"
+    log_path.write_text("")
+    thread, holder = _watch_in_background(log_path, "TAG123")
+    _write_lines(
+        log_path,
+        ["PREFETCH_EFFECT_DEBUG cmpl-TAG123-0-xyz: SPLICED n_blocks=4"],
+    )
+    thread.join(timeout=5.0)
+    result = holder["result"]
+    assert result is not None
+    assert result["req_id"] == "cmpl-TAG123-0-xyz"
+
+
+def test_watch_for_splice_times_out_when_tag_never_appears(tmp_path):
+    log_path = tmp_path / "server.log"
+    log_path.write_text("")
+    _write_lines(
+        log_path,
+        [
+            "PREFETCH_EFFECT_DEBUG cmpl-someone-else-0-xyz: PARTIAL SPLICE spliced=1 reloaded=0 covered=1.00"
+        ],
+    )
+    result = adaptive_splice_probe.watch_for_splice(
+        str(log_path), "TAG123", timeout_s=0.5, poll_interval_s=0.05
+    )
+    assert result is None
+
+
+def test_watch_for_splice_only_sees_lines_written_after_it_starts(tmp_path):
+    """Confirms the tail starts from the CURRENT end of the file, not the
+    beginning -- replaying old lines could false-positive on a stale event
+    from a previous, unrelated request that happens to share a tag prefix
+    substring by coincidence."""
+    log_path = tmp_path / "server.log"
+    log_path.write_text(
+        "PREFETCH_EFFECT_DEBUG cmpl-TAG123-0-old: PARTIAL SPLICE spliced=1 reloaded=0 covered=1.00\n"
+    )
+    result = adaptive_splice_probe.watch_for_splice(
+        str(log_path), "TAG123", timeout_s=0.5, poll_interval_s=0.05
+    )
+    assert result is None

@@ -25,6 +25,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from semantic_offload._debug import ENABLED as _DEBUG_ENABLED
 from semantic_offload._debug import debug_print
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
@@ -213,6 +214,13 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         prior prefetch has fully completed and cleared."""
         if not self._preempted_pending:
             return
+        if _DEBUG_ENABLED:
+            debug_print(
+                f"STALL_DEBUG retry_sweep pending={list(self._preempted_pending)} "
+                f"free_blocks={self.gpu_block_pool.get_num_free_blocks() if self.gpu_block_pool else None} "
+                f"reserved={self._prefetch_reserved_blocks} "
+                f"prefetched_keys={list(self._prefetched.keys())}"
+            )
         this_step_preempted = scheduler_output.preempted_req_ids or ()
         succeeded = [
             req_id
@@ -366,6 +374,14 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         return super().request_finished(request)
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        if _DEBUG_ENABLED:
+            meta = connector_output.kv_connector_worker_meta
+            completed = getattr(meta, "completed_jobs", None)
+            debug_print(
+                f"STALL_DEBUG update_connector_output completed_jobs={completed} "
+                f"live_jobs={list(self._jobs.keys())} "
+                f"transfer_jobs_by_req={ {rid: list(rs.transfer_jobs) for rid, rs in self._req_status.items() if rs.transfer_jobs} }"
+            )
         super().update_connector_output(connector_output)
         # A prefetch whose owning request already finished/aborted while
         # its load job was still in flight has no one left to ever splice

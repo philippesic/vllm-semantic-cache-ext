@@ -1,0 +1,5 @@
+k,actual_rank,full_block_bytes,summary_bytes,summary_pct_of_block,build_time_per_block_us,overlap_confirmed,mm_window_ms,svd_window_ms
+4,4,8192,2048,25.0,1383.83,True,"[0.29,201.14]","[56.85,333.62]"
+8,8,8192,4096,50.0,891.67,True,"[0.20,144.34]","[1.20,179.53]"
+16,16,8192,8192,100.0,917.18,True,"[0.20,145.27]","[1.17,184.61]"
+32,16,8192,8192,100.0,921.31,True,"[0.20,144.61]","[1.16,185.42]"

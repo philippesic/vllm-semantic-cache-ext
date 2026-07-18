@@ -1,0 +1,6 @@
+method,n_cases,attn_recall@4,needle_hit@4,attn_recall@8,needle_hit@8
+lru,16,0.25,0.0,0.125,0.0
+arc,16,0.25,0.0,0.125,0.0
+minmax,16,0.7344,0.5833,0.6641,0.7917
+mean,16,0.875,0.9583,0.8438,1.0
+oracle,16,1.0,0.9583,0.8906,1.0

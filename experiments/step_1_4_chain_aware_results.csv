@@ -1,0 +1,4 @@
+variant,sessions_complete_total,sessions_total,complete_rate,avg_chain_fraction_recovered
+lru,21,30,0.7,0.8778
+semantic_no_chain,21,30,0.7,0.8778
+semantic_chain_aware,8,30,0.2667,0.8639

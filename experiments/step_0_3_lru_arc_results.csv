@@ -1,0 +1,3 @@
+method,recall@4,n_probes@4,recall@8,n_probes@8
+lru,0.45,25,0.435,25
+arc,0.45,25,0.435,25

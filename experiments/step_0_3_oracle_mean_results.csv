@@ -1,0 +1,5 @@
+method,recall@4,n_probes@4,recall@8,n_probes@8
+oracle_real_maxkey,0.65,25,0.66,25
+mean_only,0.56,25,0.575,25
+minmax_plus_mean_avg,0.59,25,0.54,25
+minmax_only,0.44,25,0.445,25

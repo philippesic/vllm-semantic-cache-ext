@@ -317,21 +317,34 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
             self._durably_key_summaries(job_id, block_ids)
 
     def _build_summaries_body(self, block_ids) -> None:
-        for layer_name, layer in self._attention_layers.items():
-            kv_cache = getattr(layer, "kv_cache", None)
-            if kv_cache is None or kv_cache.numel() == 0:
-                continue
-            self._check_layout(layer_name, layer, kv_cache)
-            head_size = layer.head_size
-            layer_summaries = self.summaries[layer_name]
-            for block_id in block_ids:
-                block_id = int(block_id)
-                # block: [num_kv_heads, block_size, 2 * head_size]
-                block = kv_cache[block_id]
-                keys = block[..., :head_size].float()  # K half, upcast for MAD
-                layer_summaries[block_id] = [
-                    build_summary(keys[h]) for h in range(keys.shape[0])
-                ]
+        # Real bug found on a B200 production-scale run (issues log entry
+        # #53's follow-up): this used to loop over EVERY attention layer in
+        # the model (self._attention_layers, ~28 for a 7B model), but
+        # self.summaries is only ever READ for self._probe_layer_name
+        # (_durably_key_summaries below, the only call site) -- every other
+        # layer's summary was real, non-trivial tensor work (4 reductions
+        # per KV head per block) computed and thrown away, unread, on
+        # every single block stored. Restricting to just the probe layer
+        # cuts this by roughly the model's layer count.
+        if self._probe_layer_name is None:
+            return
+        layer = self._attention_layers.get(self._probe_layer_name)
+        if layer is None:
+            return
+        kv_cache = getattr(layer, "kv_cache", None)
+        if kv_cache is None or kv_cache.numel() == 0:
+            return
+        self._check_layout(self._probe_layer_name, layer, kv_cache)
+        head_size = layer.head_size
+        layer_summaries = self.summaries[self._probe_layer_name]
+        for block_id in block_ids:
+            block_id = int(block_id)
+            # block: [num_kv_heads, block_size, 2 * head_size]
+            block = kv_cache[block_id]
+            keys = block[..., :head_size].float()  # K half, upcast for MAD
+            layer_summaries[block_id] = [
+                build_summary(keys[h]) for h in range(keys.shape[0])
+            ]
 
     def _durably_key_summaries(self, job_id: int, block_ids) -> None:
         """Re-key this job's probe-layer summaries by OffloadKey so they

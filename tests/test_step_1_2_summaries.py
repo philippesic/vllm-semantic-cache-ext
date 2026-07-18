@@ -38,7 +38,13 @@ def _make_worker(layers: dict, block_size: int) -> SemanticOffloadingWorker:
     worker._summary_stream = None
     worker._layout_checked = set()
     worker.summaries = {name: {} for name in layers}
-    worker._probe_layer_name = None  # Step 1.3 re-keying is out of scope here
+    # _build_summaries_body only computes the probe layer's summaries now
+    # (issues log entry #53's follow-up: building every model layer's
+    # summary when only the probe layer is ever read was real, wasted,
+    # non-trivial per-block tensor work) -- these tests all use a single
+    # layer, so it's always the probe layer; re-keying itself (Step 1.3)
+    # is still out of scope here.
+    worker._probe_layer_name = next(iter(layers), None)
     worker._pending_job_keys = {}
     worker.durable_summaries = {}
     return worker
@@ -103,3 +109,26 @@ def test_no_blocks_is_a_noop():
     worker = _make_worker({"layer0": layer}, block_size=16)
     worker._build_summaries_for_blocks(0, [])
     assert worker.summaries["layer0"] == {}
+
+
+def test_only_the_probe_layer_gets_summaries_built():
+    """Regression test for issues log entry #53's follow-up: a real B200
+    run showed _build_summaries_body looping over EVERY attention layer
+    (~28 for a 7B model) even though self.summaries is only ever read for
+    self._probe_layer_name -- every other layer's summary was real,
+    non-trivial tensor work computed and discarded, unread, on every
+    single block stored. With several layers configured, only the probe
+    layer's dict should ever get populated."""
+    num_blocks, num_kv_heads, block_size, head_size = 4, 2, 16, 16
+    layers = {
+        name: _make_layer(num_blocks, num_kv_heads, block_size, head_size, seed=i)
+        for i, name in enumerate(["layer0", "layer1", "layer2"])
+    }
+    worker = _make_worker(layers, block_size)
+    worker._probe_layer_name = "layer1"  # deliberately not the first layer
+
+    worker._build_summaries_for_blocks(0, [0])
+
+    assert worker.summaries["layer1"] != {}
+    assert worker.summaries["layer0"] == {}
+    assert worker.summaries["layer2"] == {}

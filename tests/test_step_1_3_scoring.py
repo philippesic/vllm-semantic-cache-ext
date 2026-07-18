@@ -6,21 +6,23 @@ the real server instead; see .claude/docs/semantic-eviction-plan.md Step 1.3
 and the issues log for that investigation).
 """
 
+import pytest
 import torch
-from semantic_offload.index import BlockSummary
+from semantic_offload.index import BlockSummary, score
 from semantic_offload.manager import SemanticOffloadingManager
 from semantic_offload.worker import SemanticOffloadingWorker
 
 from vllm.v1.kv_offload.base import make_offload_key
 
 
-def _make_worker() -> SemanticOffloadingWorker:
+def _make_worker(method: str = "minmax") -> SemanticOffloadingWorker:
     worker = SemanticOffloadingWorker.__new__(SemanticOffloadingWorker)
     worker._probe_layer_name = "layer0"
     worker.summaries = {"layer0": {}}
     worker._pending_job_keys = {}
     worker.durable_summaries = {}
     worker._pending_scores = {}
+    worker._method = method
     return worker
 
 
@@ -75,28 +77,78 @@ def test_durably_key_summaries_no_job_keys_is_noop():
     assert worker.durable_summaries == {}
 
 
-def test_on_query_captured_ranks_needle_highest_for_all_methods():
+def test_on_query_captured_ranks_needle_highest_only_for_configured_method():
     """Single-KV-head case (durable_summaries[key] = [BlockSummary]); the
     multi-head max-combine path (entry #9) is exercised implicitly since
-    len == 1 makes max() a no-op over one element."""
-    worker = _make_worker()
-    needle_key = to_key(1)
-    distractor_keys = [to_key(i) for i in range(2, 6)]
+    len == 1 makes max() a no-op over one element.
 
-    query = torch.tensor([[5.0, 5.0, 5.0, 5.0]])  # [num_kv_heads=1, head_dim]
-    worker.durable_summaries[needle_key] = [_summary(5.0)]  # aligned with query
-    for i, key in enumerate(distractor_keys):
-        worker.durable_summaries[key] = [_summary(-5.0 - i)]  # anti-aligned
-
-    worker._on_query_captured("req-1", query)
-    scores = worker.pop_pending_scores()
-
+    Only the worker's own configured method should ever be scored --
+    SemanticPolicy only ever consults its own method's relevance EMA, so
+    computing the other two is pure waste (the bug behind the catastrophic
+    TTFT found on a real B200 run, entry #53): confirm the other two
+    methods' entries don't exist at all, not just that they're empty."""
     for method in ("minmax", "mean", "cuboid_mean"):
+        worker = _make_worker(method=method)
+        needle_key = to_key(1)
+        distractor_keys = [to_key(i) for i in range(2, 6)]
+
+        query = torch.tensor([[5.0, 5.0, 5.0, 5.0]])  # [num_kv_heads=1, head_dim]
+        worker.durable_summaries[needle_key] = [_summary(5.0)]  # aligned
+        for i, key in enumerate(distractor_keys):
+            worker.durable_summaries[key] = [_summary(-5.0 - i)]  # anti-aligned
+
+        worker._on_query_captured("req-1", query)
+        scores = worker.pop_pending_scores()
+
+        assert set(scores.keys()) == {method}, (
+            f"expected only {method!r} to be scored, got {list(scores)}"
+        )
         ranked = scores[method]["req-1"]
         assert ranked[0][0] == needle_key, f"{method} did not rank needle first"
 
-    # popping again returns nothing left to report
-    assert worker.pop_pending_scores() == {}
+        # popping again returns nothing left to report
+        assert worker.pop_pending_scores() == {}
+
+
+def test_batched_scoring_matches_scalar_scoring_per_candidate():
+    """Regression test for the vectorization itself: the batched worker
+    path must produce the exact same ranking (and near-identical scores,
+    modulo floating-point summation order) as the original scalar
+    score()-per-candidate loop it replaced."""
+    torch.manual_seed(0)
+    num_kv_heads, head_dim, n_candidates = 3, 8, 12
+    query = torch.randn(num_kv_heads, head_dim)
+
+    keys = [to_key(i) for i in range(n_candidates)]
+    summary_lists = {
+        key: [
+            BlockSummary(
+                min=torch.randn(head_dim),
+                max=torch.randn(head_dim),
+                mean=torch.randn(head_dim),
+                mad=torch.rand(head_dim),
+            )
+            for _ in range(num_kv_heads)
+        ]
+        for key in keys
+    }
+
+    for method in ("minmax", "mean", "cuboid_mean"):
+        worker = _make_worker(method=method)
+        worker.durable_summaries = dict(summary_lists)
+        worker._on_query_captured("req-1", query)
+        batched_ranked = dict(worker.pop_pending_scores()[method]["req-1"])
+
+        scalar_scores = {
+            key: max(
+                score(method, query[h], summary_list[h]) for h in range(num_kv_heads)
+            )
+            for key, summary_list in summary_lists.items()
+        }
+
+        assert set(batched_ranked) == set(scalar_scores)
+        for key in keys:
+            assert batched_ranked[key] == pytest.approx(scalar_scores[key], abs=1e-4)
 
 
 def test_manager_update_relevance_ema():

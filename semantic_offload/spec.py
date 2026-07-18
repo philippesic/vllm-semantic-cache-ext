@@ -17,11 +17,16 @@ from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 class SemanticOffloadingSpec(CPUOffloadingSpec):
     @override
     def create_worker(self, kv_caches: CanonicalKVCaches) -> SemanticOffloadingWorker:
+        # Worker-side scoring only ever needs the one configured method
+        # (SemanticPolicy only consults its own method's relevance EMA) --
+        # same extra_config key get_manager() already reads below.
+        method = str(self.extra_config.get("method", "minmax"))
         return SemanticOffloadingWorker(
             kv_caches=kv_caches,
             block_size_factor=self.block_size_factor,
             num_cpu_blocks=self.num_blocks,
             vllm_config=self.vllm_config,
+            method=method,
         )
 
     @override

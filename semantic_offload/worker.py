@@ -44,7 +44,9 @@ from semantic_offload._debug import debug_print
 from semantic_offload.index import (
     BlockSummary,
     build_summary,
-    score,
+    score_cuboid_mean_batch,
+    score_mean_batch,
+    score_minmax_batch,
 )
 from semantic_offload.query_capture import install as install_query_capture
 from vllm.config import VllmConfig
@@ -66,12 +68,18 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         block_size_factor: int,
         num_cpu_blocks: int,
         vllm_config: VllmConfig,
+        method: str = "minmax",
     ):
         super().__init__(
             kv_caches=kv_caches,
             block_size_factor=block_size_factor,
             num_cpu_blocks=num_cpu_blocks,
         )
+        if method not in _SCORING_METHODS:
+            raise ValueError(
+                f"Unknown scoring method: {method!r}. Supported: {_SCORING_METHODS}"
+            )
+        self._method = method
         static_forward_context = vllm_config.compilation_config.static_forward_context
         self._attention_layers = {
             layer_name: layer
@@ -138,46 +146,68 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         # query_repr: [num_kv_heads, head_dim]. summaries are fp32 (Step 1.2
         # upcast).
         query_repr = query_repr.float()
-        for method in _SCORING_METHODS:
-            # Score and keep EVERY resident summary, not just a top-M slice.
-            # A prior `_TOP_M=8` cap here meant most of a request's own
-            # blocks never accumulated a relevance-EMA entry at all (fewer
-            # than 8 of them would ever rank in some single query's own
-            # top-8, regardless of how small the resident pool was --
-            # confirmed unconditional, not a crowding effect, empirically
-            # at pool sizes 21-645), which was the dominant reason Step
-            # 1.5's prefetch splice could never find a fully-scored request
-            # to exact-match against (issues log entries #29-31). The
-            # per-candidate score computation below already costs the same
-            # either way (it runs before any truncation); measured real-
-            # server ITL showed no regression from dropping the cap
-            # (entry #31: ~10.95-11.0 ms/token, unbounded vs. capped at 8,
-            # statistically indistinguishable).
-            ranked = sorted(
-                (
-                    (
-                        key,
-                        # Per-head score, combined via max across heads --
-                        # different KV heads may specialize on different
-                        # content, so the head most aligned with this query
-                        # should drive the block's relevance (entry #9).
-                        max(
-                            score(method, query_repr[h], summary_list[h])
-                            for h in range(len(summary_list))
-                        ),
-                    )
-                    for key, summary_list in self.durable_summaries.items()
-                ),
-                key=lambda kv: kv[1],
-                reverse=True,
+
+        # Score and keep EVERY resident summary, not just a top-M slice. A
+        # prior `_TOP_M=8` cap here meant most of a request's own blocks
+        # never accumulated a relevance-EMA entry at all (fewer than 8 of
+        # them would ever rank in some single query's own top-8, regardless
+        # of how small the resident pool was -- confirmed unconditional, not
+        # a crowding effect, empirically at pool sizes 21-645), which was
+        # the dominant reason Step 1.5's prefetch splice could never find a
+        # fully-scored request to exact-match against (issues log entries
+        # #29-31).
+        #
+        # This used to score ALL THREE methods here via a Python loop with
+        # one `.item()`-synchronizing GPU call per (method, candidate,
+        # head) -- correct, but only `self._method` is ever actually read
+        # (SemanticPolicy only consults its own configured method), so the
+        # other two were pure waste, and per-candidate `.item()` calls force
+        # a CPU/GPU sync on every single one, serializing what should be one
+        # batched op. Measured "no regression" for dropping the top-M cap
+        # (entry #31) was on the tiny dev model with a small (~dozens-to-
+        # hundreds candidates) resident pool -- at production scale (larger
+        # model, larger CPU tier, thousands of resident candidates) this
+        # per-candidate-sync design turned multi-second per query capture,
+        # showing up as catastrophic TTFT with completely normal ITL (the
+        # ongoing-decode path never touches this code) -- found via a real
+        # B200 calibration run, not assumed. Fix: stack every candidate's
+        # summaries into batched tensors and score the whole pool in one
+        # vectorized pass, one sync total instead of one per candidate.
+        keys = list(self.durable_summaries.keys())
+        summary_lists = list(self.durable_summaries.values())
+
+        def stack_field(field: str) -> torch.Tensor:
+            # [n_candidates, num_kv_heads, head_dim]
+            return torch.stack(
+                [
+                    torch.stack([getattr(s, field) for s in summary_list])
+                    for summary_list in summary_lists
+                ]
             )
-            self._pending_scores.setdefault(method, {})[req_id] = ranked
-            debug_print(
-                f"SEMANTIC_STEP1_3_DEBUG req={req_id} method={method} "
-                f"n_summaries={len(self.durable_summaries)} "
-                f"ranked_keys={[k.hex()[:8] for k, _ in ranked]} "
-                f"scores={[round(s, 4) for _, s in ranked]}"
+
+        query = query_repr.unsqueeze(0)  # [1, num_kv_heads, head_dim]
+        if self._method == "minmax":
+            per_head = score_minmax_batch(query, stack_field("max"), stack_field("min"))
+        elif self._method == "mean":
+            per_head = score_mean_batch(query, stack_field("mean"))
+        else:  # cuboid_mean
+            per_head = score_cuboid_mean_batch(
+                query, stack_field("mean"), stack_field("mad")
             )
+        # Per-head score, combined via max across heads -- different KV
+        # heads may specialize on different content, so the head most
+        # aligned with this query should drive the block's relevance
+        # (entry #9). One sync for the whole batch (.tolist()), not one
+        # per candidate.
+        scores = per_head.max(dim=-1).values.tolist()
+        ranked = sorted(zip(keys, scores), key=lambda kv: kv[1], reverse=True)
+        self._pending_scores.setdefault(self._method, {})[req_id] = ranked
+        debug_print(
+            f"SEMANTIC_STEP1_3_DEBUG req={req_id} method={self._method} "
+            f"n_summaries={len(self.durable_summaries)} "
+            f"ranked_keys={[k.hex()[:8] for k, _ in ranked]} "
+            f"scores={[round(s, 4) for _, s in ranked]}"
+        )
 
     def _check_layout(self, layer_name: str, layer, kv_cache: torch.Tensor) -> None:
         if layer_name in self._layout_checked:

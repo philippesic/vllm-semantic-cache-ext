@@ -70,6 +70,33 @@ _SCORERS = {
 }
 
 
+def score_minmax_batch(
+    query: torch.Tensor, maxs: torch.Tensor, mins: torch.Tensor
+) -> torch.Tensor:
+    """Batched score_minmax -- mathematically identical to score_minmax()
+    applied per-candidate, but vectorized so it costs one GPU op (and one
+    CPU/GPU sync when the caller reads the result) instead of one op-plus-
+    sync per candidate. `query`: [num_kv_heads, head_dim]. `maxs`/`mins`:
+    [n_candidates, num_kv_heads, head_dim]. Returns [n_candidates,
+    num_kv_heads] (unreduced across heads -- caller combines, e.g. max())."""
+    return torch.maximum(query * maxs, query * mins).sum(dim=-1)
+
+
+def score_mean_batch(query: torch.Tensor, means: torch.Tensor) -> torch.Tensor:
+    """Batched score_mean -- see score_minmax_batch's docstring for shapes."""
+    return (query * means).sum(dim=-1)
+
+
+def score_cuboid_mean_batch(
+    query: torch.Tensor, means: torch.Tensor, mads: torch.Tensor
+) -> torch.Tensor:
+    """Batched score_cuboid_mean -- see score_minmax_batch's docstring for
+    shapes."""
+    box_min = means - mads
+    box_max = means + mads
+    return torch.maximum(query * box_max, query * box_min).sum(dim=-1)
+
+
 def average_summaries(summaries: list[BlockSummary]) -> BlockSummary:
     """Collapse a block's per-KV-head summaries into one `[head_dim]`
     representation, dimensionally matching a query representation averaged

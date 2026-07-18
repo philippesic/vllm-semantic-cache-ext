@@ -181,6 +181,17 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         self._stack_cache_dirty = False
 
     def _on_query_captured(self, req_id: str, query_repr: torch.Tensor) -> None:
+        # TEMPORARY, unconditional (not gated on durable_summaries being
+        # non-empty): confirms whether this callback fires at all and what
+        # it sees, before assuming the timing/pickle instrumentation below
+        # is even reached (issues log entry #53's follow-up -- a real B200
+        # retest showed zero SEMANTIC_STEP1_3_TIMING lines despite real
+        # store activity, meaning either this callback never fires or it's
+        # hitting the early-return below every time).
+        debug_print(
+            f"SEMANTIC_CALLBACK_DEBUG req={req_id} "
+            f"durable_summaries_len={len(self.durable_summaries)}"
+        )
         if not self.durable_summaries:
             return
         # query_repr: [num_kv_heads, head_dim]. summaries are fp32 (Step 1.2

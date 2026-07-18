@@ -38,9 +38,6 @@ backend that doesn't match it, rather than silently producing wrong
 summaries. Does not apply to MLA (no per-head keys exist there at all).
 """
 
-import pickle
-import time
-
 import torch
 
 from semantic_offload._debug import debug_print
@@ -181,17 +178,6 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         self._stack_cache_dirty = False
 
     def _on_query_captured(self, req_id: str, query_repr: torch.Tensor) -> None:
-        # TEMPORARY, unconditional (not gated on durable_summaries being
-        # non-empty): confirms whether this callback fires at all and what
-        # it sees, before assuming the timing/pickle instrumentation below
-        # is even reached (issues log entry #53's follow-up -- a real B200
-        # retest showed zero SEMANTIC_STEP1_3_TIMING lines despite real
-        # store activity, meaning either this callback never fires or it's
-        # hitting the early-return below every time).
-        debug_print(
-            f"SEMANTIC_CALLBACK_DEBUG req={req_id} "
-            f"durable_summaries_len={len(self.durable_summaries)}"
-        )
         if not self.durable_summaries:
             return
         # query_repr: [num_kv_heads, head_dim]. summaries are fp32 (Step 1.2
@@ -208,37 +194,23 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         # fully-scored request to exact-match against (issues log entries
         # #29-31).
         #
-        # This used to score ALL THREE methods here via a Python loop with
-        # one `.item()`-synchronizing GPU call per (method, candidate,
-        # head) -- correct, but only `self._method` is ever actually read
-        # (SemanticPolicy only consults its own configured method), so the
-        # other two were pure waste, and per-candidate `.item()` calls force
-        # a CPU/GPU sync on every single one, serializing what should be one
-        # batched op. Measured "no regression" for dropping the top-M cap
-        # (entry #31) was on the tiny dev model with a small (~dozens-to-
-        # hundreds candidates) resident pool -- at production scale (larger
-        # model, larger CPU tier, thousands of resident candidates) this
-        # per-candidate-sync design turned multi-second per query capture,
-        # showing up as catastrophic TTFT with completely normal ITL (the
-        # ongoing-decode path never touches this code) -- found via a real
-        # B200 calibration run, not assumed. Fixed by scoring the whole
-        # pool as one vectorized pass (one sync total instead of one per
-        # candidate) -- and, since even the batched version still measured
-        # a large TTFT gap on a real B200 retest, by caching the stacked
-        # tensors themselves (_rebuild_stack_cache) so rebuilding them from
-        # the durable_summaries dict -- itself a real Python-level cost at
-        # thousands of candidates -- only happens on actual insertions, not
-        # on every query capture.
-        # TEMPORARY timing instrumentation (issues log entry #53's follow-
-        # up): two real fixes already landed here but a real B200 retest
-        # still shows a large TTFT gap vs. lru after both -- rather than
-        # guess at a third cause, measure where the remaining time actually
-        # goes. Remove once the bottleneck is identified and fixed.
-        t0 = time.perf_counter()
-        rebuilt = self._stack_cache_dirty
+        # Scores only `self._method` (not all three) via one vectorized
+        # batched pass over the whole candidate pool (index.py's
+        # score_*_batch functions) -- one GPU sync total, not one per
+        # candidate -- against a cache of the pool stacked into tensors,
+        # rebuilt only when new candidates are inserted
+        # (_rebuild_stack_cache), not on every query capture. Found and
+        # fixed on a real B200 production-scale run (issues log entry #53):
+        # the original per-candidate `.item()`-synchronizing design and the
+        # per-query stack rebuild were both measured as "near-zero cost" on
+        # the tiny dev model's small resident pool, but turned multi-second
+        # per query capture at production scale (larger model, larger CPU
+        # tier, thousands of resident candidates) -- see entry #53 for the
+        # full investigation, including the third contributing bug (worker
+        # was building summaries for every model layer, not just this one)
+        # fixed in _build_summaries_body below.
         if self._stack_cache_dirty:
             self._rebuild_stack_cache()
-        t1 = time.perf_counter()
         keys = self._stack_cache_keys
         cache = self._stack_cache
 
@@ -255,27 +227,8 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         # (entry #9). One sync for the whole batch (.tolist()), not one
         # per candidate.
         scores = per_head.max(dim=-1).values.tolist()
-        t2 = time.perf_counter()
         ranked = sorted(zip(keys, scores), key=lambda kv: kv[1], reverse=True)
-        t3 = time.perf_counter()
         self._pending_scores.setdefault(self._method, {})[req_id] = ranked
-        # `ranked` holds ALL n_summaries candidates (truncating it is what
-        # caused the entries #29-31 splice-matching bug) -- it gets embedded
-        # whole into SemanticWorkerMetadata.pending_scores and crosses a
-        # real process boundary (worker -> scheduler) every step. None of
-        # the timing above can see that cost since it happens after this
-        # function returns -- measure pickling the same data shape directly
-        # as a stand-in for the real IPC serialization cost.
-        pickle_start = time.perf_counter()
-        payload = pickle.dumps(ranked)
-        pickle_ms = (time.perf_counter() - pickle_start) * 1000
-        debug_print(
-            f"SEMANTIC_STEP1_3_TIMING req={req_id} n_summaries={len(keys)} "
-            f"rebuilt={rebuilt} rebuild_ms={(t1 - t0) * 1000:.2f} "
-            f"score_ms={(t2 - t1) * 1000:.2f} sort_ms={(t3 - t2) * 1000:.2f} "
-            f"total_ms={(t3 - t0) * 1000:.2f} "
-            f"pickle_ms={pickle_ms:.2f} payload_bytes={len(payload)}"
-        )
         debug_print(
             f"SEMANTIC_STEP1_3_DEBUG req={req_id} method={self._method} "
             f"n_summaries={len(self.durable_summaries)} "

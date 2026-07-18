@@ -17,12 +17,10 @@ issues log entries #10 and #11 (grace period -- temporary eviction immunity
 for freshly-inserted, as-yet-unscored blocks).
 """
 
-import time
 from collections.abc import Iterable
 
 from typing_extensions import override
 
-from semantic_offload._debug import debug_print
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
@@ -194,14 +192,6 @@ class SemanticPolicy(CachePolicy):
     def evict(
         self, n: int, protected: set[OffloadKey]
     ) -> list[tuple[OffloadKey, BlockStatus]] | None:
-        # TEMPORARY timing instrumentation (issues log entry #53's follow-
-        # up): all three costs measured so far in the worker's own scoring
-        # path (_on_query_captured) are sub-millisecond on a real B200
-        # calibration run, yet TTFT is still ~40x worse than lru -- this is
-        # the one major remaining unmeasured code path (scheduler-side
-        # eviction decisions), and real preemptions are confirmed happening
-        # in the same run. Remove once the bottleneck is identified.
-        t0 = time.perf_counter()
         if n == 0:
             return []
         # Non-destructive read of LRU's real recency order (oldest first --
@@ -213,17 +203,9 @@ class SemanticPolicy(CachePolicy):
         ]
         if len(candidates) < n:
             return None
-        t1 = time.perf_counter()
 
         if self._mode == "unscored_last":
-            result = self._evict_unscored_last(n, candidates)
-            debug_print(
-                f"SEMANTIC_EVICT_TIMING mode=unscored_last n={n} "
-                f"n_candidates={len(candidates)} "
-                f"candidates_ms={(t1 - t0) * 1000:.2f} "
-                f"total_ms={(time.perf_counter() - t0) * 1000:.2f}"
-            )
-            return result
+            return self._evict_unscored_last(n, candidates)
 
         # Grace period (entry #11): a *soft* bonus, not a hard exclude. A
         # hard exclude-then-fallback-to-oldest-in-grace design was tried
@@ -314,24 +296,14 @@ class SemanticPolicy(CachePolicy):
                 base += session_bonus_for(key)
             return base
 
-        t2 = time.perf_counter()
         scored = [
             (keep_score(idx, key), key, block)
             for idx, (key, block) in enumerate(candidates)
         ]
-        t3 = time.perf_counter()
         scored.sort(key=lambda t: t[0])  # lowest keep_score evicted first
         chosen = scored[:n]
         for _, key, _ in chosen:
             self._lru.remove(key)
-        debug_print(
-            f"SEMANTIC_EVICT_TIMING mode=blend n={n} n_candidates={total} "
-            f"candidates_ms={(t1 - t0) * 1000:.2f} "
-            f"setup_ms={(t2 - t1) * 1000:.2f} "
-            f"score_ms={(t3 - t2) * 1000:.2f} "
-            f"sort_ms={(time.perf_counter() - t3) * 1000:.2f} "
-            f"total_ms={(time.perf_counter() - t0) * 1000:.2f}"
-        )
         return [(key, block) for _, key, block in chosen]
 
     def _evict_unscored_last(

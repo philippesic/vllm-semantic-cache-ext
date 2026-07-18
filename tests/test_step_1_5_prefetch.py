@@ -183,8 +183,6 @@ def _make_connector_scheduler(
     sched._prefetched = {}
     sched._prefetch_reserved_blocks = 0
     sched._preempted_pending = set()
-    sched._preempted_at = {}
-    sched._retry_attempts = {}
     sched._req_status = {}
     sched._current_batch_load_jobs = {}
     sched._current_batch_prefetch_load_jobs = {}
@@ -384,8 +382,6 @@ def test_on_request_preempted_is_noop_when_prefetch_disabled():
         sched.on_request_preempted(SimpleNamespace(request_id="r1"))
 
     assert sched._preempted_pending == set()
-    assert sched._preempted_at == {}
-    assert sched._retry_attempts == {}
 
 
 def test_retry_pending_prefetches_skips_requests_preempted_this_step():

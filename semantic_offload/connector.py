@@ -21,7 +21,6 @@ protocol (see .claude/docs/semantic-eviction-plan.md, Step 1.3):
   relevance state Step 1.4 will read from.
 """
 
-import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -183,19 +182,6 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         # `load_jobs` -- see SemanticOffloadingConnectorMetadata.prefetch_load_jobs
         # for why), reset every step in build_connector_meta the same way.
         self._current_batch_prefetch_load_jobs: dict[int, TransferJob] = {}
-        # TEMPORARY timing instrumentation (issues log entry #53's follow-
-        # up): everything measured in the worker-side scoring path and in
-        # SemanticPolicy.evict() came back sub-millisecond on a real B200
-        # run, yet TTFT is still ~75x worse than lru under a MATCHED tight-
-        # capacity config (same preemption pressure for both) -- and that
-        # same run showed MORE preemptions for semantic-minmax than lru
-        # under identical config, pointing at this prefetch/reservation
-        # subsystem (which lru doesn't have at all) rather than scoring.
-        # Tracks how long a request actually spends in _preempted_pending
-        # (real wall-clock, not a single call's cost) and how many retry
-        # attempts that took. Remove once the bottleneck is identified.
-        self._preempted_at: dict[str, float] = {}
-        self._retry_attempts: dict[str, int] = {}
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         self.gpu_block_pool = gpu_block_pool
@@ -217,8 +203,6 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         if _DISABLE_PREFETCH:
             return
         self._preempted_pending.add(request.request_id)
-        self._preempted_at[request.request_id] = time.monotonic()
-        self._retry_attempts[request.request_id] = 0
 
     def _retry_pending_prefetches(self, scheduler_output: SchedulerOutput) -> None:
         """Called every scheduling step (from build_connector_meta), for
@@ -241,26 +225,12 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
                 f"prefetched_keys={list(self._prefetched.keys())}"
             )
         this_step_preempted = scheduler_output.preempted_req_ids or ()
-        succeeded = []
-        for req_id in self._preempted_pending:
-            if req_id in this_step_preempted:
-                continue
-            self._retry_attempts[req_id] = self._retry_attempts.get(req_id, 0) + 1
-            if self._attempt_prefetch_reservation(req_id):
-                succeeded.append(req_id)
-                # Reservation succeeded -- NOT the same as the request being
-                # re-admitted yet (that's update_state_after_alloc). Log this
-                # as its own marker but deliberately don't pop
-                # _preempted_at/_retry_attempts here, so the eventual
-                # readmission timing below measures the full preemption ->
-                # running span, the number that actually matters for TTFT.
-                started = self._preempted_at.get(req_id)
-                if started is not None:
-                    debug_print(
-                        f"SEMANTIC_PREFETCH_RESERVED_TIMING req={req_id} "
-                        f"reserved_after_ms={(time.monotonic() - started) * 1000:.2f} "
-                        f"attempts={self._retry_attempts.get(req_id)}"
-                    )
+        succeeded = [
+            req_id
+            for req_id in self._preempted_pending
+            if req_id not in this_step_preempted
+            and self._attempt_prefetch_reservation(req_id)
+        ]
         self._preempted_pending.difference_update(succeeded)
 
     def _attempt_prefetch_reservation(self, req_id: str) -> bool:
@@ -387,14 +357,6 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         # this is the one lifecycle point that always fires before a
         # request's state is torn down, regardless of how it ends.
         self._preempted_pending.discard(request.request_id)
-        started = self._preempted_at.pop(request.request_id, None)
-        attempts = self._retry_attempts.pop(request.request_id, None)
-        if started is not None:
-            debug_print(
-                f"SEMANTIC_PREFETCH_RESOLVE_TIMING req={request.request_id} "
-                f"resolved_ms={(time.monotonic() - started) * 1000:.2f} "
-                f"attempts={attempts} abandoned=True"
-            )
         state = self._prefetched.get(request.request_id)
         if state is not None:
             job_status = self._jobs.get(state.job_id)
@@ -658,14 +620,6 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         # Being re-admitted at all means this request is no longer
         # preempted -- stop retrying it regardless of what happens below.
         self._preempted_pending.discard(request.request_id)
-        started = self._preempted_at.pop(request.request_id, None)
-        attempts = self._retry_attempts.pop(request.request_id, None)
-        if started is not None:
-            debug_print(
-                f"SEMANTIC_PREFETCH_RESOLVE_TIMING req={request.request_id} "
-                f"resolved_ms={(time.monotonic() - started) * 1000:.2f} "
-                f"attempts={attempts} via=readmission"
-            )
         if num_external_tokens > 0 and self._try_splice_prefetch(
             request, blocks, num_external_tokens
         ):

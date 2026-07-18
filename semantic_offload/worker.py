@@ -38,6 +38,8 @@ backend that doesn't match it, rather than silently producing wrong
 summaries. Does not apply to MLA (no per-head keys exist there at all).
 """
 
+import time
+
 import torch
 
 from semantic_offload._debug import debug_print
@@ -215,8 +217,16 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         # the durable_summaries dict -- itself a real Python-level cost at
         # thousands of candidates -- only happens on actual insertions, not
         # on every query capture.
+        # TEMPORARY timing instrumentation (issues log entry #53's follow-
+        # up): two real fixes already landed here but a real B200 retest
+        # still shows a large TTFT gap vs. lru after both -- rather than
+        # guess at a third cause, measure where the remaining time actually
+        # goes. Remove once the bottleneck is identified and fixed.
+        t0 = time.perf_counter()
+        rebuilt = self._stack_cache_dirty
         if self._stack_cache_dirty:
             self._rebuild_stack_cache()
+        t1 = time.perf_counter()
         keys = self._stack_cache_keys
         cache = self._stack_cache
 
@@ -233,8 +243,16 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         # (entry #9). One sync for the whole batch (.tolist()), not one
         # per candidate.
         scores = per_head.max(dim=-1).values.tolist()
+        t2 = time.perf_counter()
         ranked = sorted(zip(keys, scores), key=lambda kv: kv[1], reverse=True)
+        t3 = time.perf_counter()
         self._pending_scores.setdefault(self._method, {})[req_id] = ranked
+        debug_print(
+            f"SEMANTIC_STEP1_3_TIMING req={req_id} n_summaries={len(keys)} "
+            f"rebuilt={rebuilt} rebuild_ms={(t1 - t0) * 1000:.2f} "
+            f"score_ms={(t2 - t1) * 1000:.2f} sort_ms={(t3 - t2) * 1000:.2f} "
+            f"total_ms={(t3 - t0) * 1000:.2f}"
+        )
         debug_print(
             f"SEMANTIC_STEP1_3_DEBUG req={req_id} method={self._method} "
             f"n_summaries={len(self.durable_summaries)} "

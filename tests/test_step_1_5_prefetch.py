@@ -196,7 +196,10 @@ def _make_connector_scheduler(
     # request needing N blocks by just handing it N keys and N stub GPU
     # blocks -- the arithmetic in _compute_load_plan degenerates cleanly.
     group_config = SimpleNamespace(
-        gpu_block_size=1, offloaded_block_size=1, hash_block_size_factor=1
+        gpu_block_size=1,
+        offloaded_block_size=1,
+        hash_block_size_factor=1,
+        sliding_window_size_in_blocks=None,
     )
     sched.config = SimpleNamespace(
         num_workers=1,
@@ -596,3 +599,110 @@ def test_partial_splice_falls_through_when_multi_group():
         sched._try_splice_prefetch(SimpleNamespace(request_id="r1"), blocks, 1) is False
     )
     assert not sched._pending_splice_jobs
+
+
+def test_two_concurrent_partial_splices_dont_interfere():
+    """Partial-splice plan doc, Open Risk #5: concurrent preemptions
+    sharing the prefetch budget was flagged as untested at the bookkeeping
+    level. Two DIFFERENT requests, each with its own partial prefetch
+    (covering only some of what each needs), processed in the same
+    scheduling step -- neither's splice/remainder state may clobber the
+    other's, and each gets its own distinct remainder-reload job."""
+    manager = SemanticOffloadingManager(num_blocks=10)
+    k0, k1, k2 = to_key(0), to_key(1), to_key(2)
+    j0, j1 = to_key(10), to_key(11)
+    _insert_resident(manager, k0, block_id=0)
+    _insert_resident(manager, k2, block_id=1)
+    _insert_resident(manager, j1, block_id=2)
+    sched = _make_connector_scheduler(manager, _StubBlockPool(20, free_blocks=5))
+    _add_req_status(sched, "req1", keys=[k0, k1, k2])
+    _add_req_status(sched, "req2", keys=[j0, j1])
+    # req1's prefetch covers only the middle key; req2's covers only the
+    # first -- deliberately different shapes so a bug that mixed up their
+    # state would show up as wrong keys/blocks, not just wrong counts.
+    sched._prefetched["req1"] = _PrefetchState(job_id=1, keys=[k1], gpu_block_ids=[77])
+    sched._prefetched["req2"] = _PrefetchState(job_id=2, keys=[j0], gpu_block_ids=[88])
+    blocks1 = _make_pending_blocks(3, start_block_id=100)  # dst [100, 101, 102]
+    blocks2 = _make_pending_blocks(2, start_block_id=200)  # dst [200, 201]
+
+    assert (
+        sched._try_splice_prefetch(SimpleNamespace(request_id="req1"), blocks1, 3)
+        is True
+    )
+    assert (
+        sched._try_splice_prefetch(SimpleNamespace(request_id="req2"), blocks2, 2)
+        is True
+    )
+
+    assert sched._pending_splice_jobs["req1"] == ([77], [101])
+    assert sched._pending_splice_jobs["req2"] == ([88], [200])
+
+    assert len(sched._current_batch_load_jobs) == 2
+    jobs_by_req = {job.req_id: job for job in sched._current_batch_load_jobs.values()}
+    assert list(jobs_by_req["req1"].dst_spec.block_ids) == [100, 102]
+    assert list(jobs_by_req["req2"].dst_spec.block_ids) == [201]
+    # Distinct job ids -- a bug reusing a counter or a shared dict key
+    # would collide these.
+    assert len(sched._current_batch_load_jobs) == len(
+        set(sched._current_batch_load_jobs.keys())
+    )
+    assert sched._req_status["req1"].transfer_jobs == {
+        jid for jid, j in sched._current_batch_load_jobs.items() if j.req_id == "req1"
+    }
+    assert sched._req_status["req2"].transfer_jobs == {
+        jid for jid, j in sched._current_batch_load_jobs.items() if j.req_id == "req2"
+    }
+    # The allocated-block-id fence must cover BOTH requests' splice and
+    # remainder destinations, not just whichever ran second.
+    assert sched._current_batch_allocated_block_ids >= {100, 101, 102, 200, 201}
+
+
+def test_compute_load_plan_matches_the_real_base_method():
+    """Partial-splice plan doc, Open Risk #2: `_compute_load_plan`
+    duplicates ~40 lines of `OffloadingConnectorScheduler.
+    update_state_after_alloc`'s positional keys/dst-block computation
+    (scheduler.py:749-821), because the base method takes no "just tell me
+    the plan" parameter. That duplication silently desyncs on a future
+    vLLM bump. Pin it here: run the REAL inherited base method (via a
+    second stub scheduler with no prefetch registered, so our own
+    update_state_after_alloc override falls straight through to
+    super()) and assert it registers exactly the keys/dst-blocks
+    _compute_load_plan independently predicted for the same inputs."""
+    manager = SemanticOffloadingManager(num_blocks=10)
+    k0, k1, k2 = to_key(0), to_key(1), to_key(2)
+    _insert_resident(manager, k0, block_id=0)
+    _insert_resident(manager, k1, block_id=1)
+    _insert_resident(manager, k2, block_id=2)
+
+    sched_predict = _make_connector_scheduler(
+        manager, _StubBlockPool(20, free_blocks=5)
+    )
+    _add_req_status(sched_predict, "r1", keys=[k0, k1, k2])
+    blocks_predict = _make_pending_blocks(3, start_block_id=100)
+    plan = sched_predict._compute_load_plan(
+        SimpleNamespace(request_id="r1"), blocks_predict, 3
+    )
+    assert plan is not None
+    predicted_keys, predicted_dst, _, _ = plan
+
+    sched_real = _make_connector_scheduler(manager, _StubBlockPool(20, free_blocks=5))
+    _add_req_status(sched_real, "r1", keys=[k0, k1, k2])
+    blocks_real = _make_pending_blocks(3, start_block_id=100)
+    # No entry in sched_real._prefetched -- _try_splice_prefetch returns
+    # False immediately, so this exercises the REAL super().
+    # update_state_after_alloc() fallthrough, not our own logic.
+    sched_real.update_state_after_alloc(
+        SimpleNamespace(request_id="r1"), blocks_real, 3
+    )
+
+    assert len(sched_real._current_batch_load_jobs) == 1
+    (real_job,) = sched_real._current_batch_load_jobs.values()
+    real_keys = sched_real._jobs[next(iter(sched_real._jobs))].keys
+
+    # TransferJobStatus.keys is itself a set (the base method's own
+    # bookkeeping discards order), so a set comparison is the real level
+    # of fidelity available post-hoc for content; dst_spec.block_ids stays
+    # a positional list, so that comparison IS order-sensitive -- between
+    # the two, a desync in either content or ordering would be caught.
+    assert set(predicted_keys) == real_keys
+    assert predicted_dst == list(real_job.dst_spec.block_ids)

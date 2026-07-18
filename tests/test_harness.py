@@ -140,6 +140,79 @@ def test_parse_vllm_bench_result_extracts_expected_fields():
         os.unlink(path)
 
 
+def test_mixed_case_produces_one_row_per_subworkload_plus_needle_rows():
+    from unittest.mock import patch
+
+    import benchmarks.run_latency_suite as rls
+
+    def fake_bench_serve(
+        base_url, model, workload, num_prompts, rate, scale, path, seed=None
+    ):
+        return {"duration_s": 1.0, "throughput_tok_s": 42.0}
+
+    def fake_needle_case(base_url, *, reference_count, num_distractors, model, seed):
+        return {"hit": True}
+
+    with (
+        patch.object(rls, "run_vllm_bench_serve", side_effect=fake_bench_serve),
+        patch.object(
+            rls.needle_workload, "run_needle_case", side_effect=fake_needle_case
+        ),
+    ):
+        rows = rls.run_mixed_case(
+            "http://x",
+            "model",
+            "/tmp",
+            "semantic-minmax",
+            10.0,
+            600,
+            1.0,
+            None,
+            [0, 1],
+        )
+
+    sub_workloads = {r["sub_workload"] for r in rows}
+    assert sub_workloads == {"chat", "rag", "longdoc", "needle"}
+    for r in rows:
+        assert r["workload"] == "mixed"
+        assert "error" not in r
+    chat_row = next(r for r in rows if r["sub_workload"] == "chat")
+    assert chat_row["num_prompts"] == round(600 * 0.40)
+    assert chat_row["request_rate"] == pytest.approx(10.0 * 0.40)
+
+
+def test_mixed_case_isolates_one_subworkload_failure():
+    from unittest.mock import patch
+
+    import benchmarks.run_latency_suite as rls
+
+    def flaky_bench_serve(
+        base_url, model, workload, num_prompts, rate, scale, path, seed=None
+    ):
+        if workload == "rag":
+            raise RuntimeError("simulated stall (vLLM issue #45388)")
+        return {"duration_s": 1.0, "throughput_tok_s": 42.0}
+
+    def fake_needle_case(base_url, *, reference_count, num_distractors, model, seed):
+        return {"hit": False}
+
+    with (
+        patch.object(rls, "run_vllm_bench_serve", side_effect=flaky_bench_serve),
+        patch.object(
+            rls.needle_workload, "run_needle_case", side_effect=fake_needle_case
+        ),
+    ):
+        rows = rls.run_mixed_case(
+            "http://x", "model", "/tmp", "lru", 10.0, 100, 1.0, None, [0]
+        )
+
+    by_sub = {r["sub_workload"]: r for r in rows}
+    assert "error" in by_sub["rag"]
+    assert "error" not in by_sub["chat"]
+    assert "error" not in by_sub["longdoc"]
+    assert by_sub["needle"]["needle_hit_rate"] == 0.0
+
+
 def test_resolve_num_prompts_from_target_duration():
     from benchmarks.run_latency_suite import resolve_num_prompts
 
@@ -221,6 +294,63 @@ def test_grid_sweep_cell_args_use_num_prompts_when_no_duration_given():
     assert "--num-prompts" in args and args[args.index("--num-prompts") + 1] == "20"
     assert "--target-duration-s" not in args
     assert "--num-gpu-blocks-override" not in args
+
+
+def test_build_slots_assigns_unique_port_and_output_dir_per_gpu():
+    from benchmarks.run_grid_sweep import build_slots
+
+    slots = build_slots(["0", "3", "7"], base_port=8199, output_dir="/tmp/out")
+
+    assert [s["gpu_id"] for s in slots] == ["0", "3", "7"]
+    assert [s["port"] for s in slots] == [8199, 8200, 8201]
+    assert len({s["output_dir"] for s in slots}) == 3  # all unique
+    assert all(s["output_dir"].startswith("/tmp/out/gpu") for s in slots)
+
+
+def test_build_slots_single_gpu_reproduces_original_port_and_dir():
+    from benchmarks.run_grid_sweep import build_slots
+
+    slots = build_slots(["0"], base_port=8199, output_dir="/tmp/out")
+
+    assert slots == [{"gpu_id": "0", "port": 8199, "output_dir": "/tmp/out/gpu0"}]
+
+
+def test_merge_results_concatenates_all_slots_keeping_one_header(tmp_path):
+    from benchmarks.run_grid_sweep import build_slots, merge_results
+
+    slots = build_slots(["0", "1"], base_port=8199, output_dir=str(tmp_path))
+    for slot in slots:
+        os.makedirs(slot["output_dir"], exist_ok=True)
+
+    with open(os.path.join(slots[0]["output_dir"], "results.csv"), "w") as f:
+        f.write("policy,seed\nlru,1\n")
+    with open(os.path.join(slots[1]["output_dir"], "results.csv"), "w") as f:
+        f.write("policy,seed\nsemantic-minmax,2\n")
+
+    merged_path = merge_results(str(tmp_path), slots)
+
+    with open(merged_path) as f:
+        content = f.read()
+    assert content.count("policy,seed") == 1  # exactly one header
+    assert "lru,1" in content
+    assert "semantic-minmax,2" in content
+
+
+def test_merge_results_skips_slots_with_no_results_file(tmp_path):
+    from benchmarks.run_grid_sweep import build_slots, merge_results
+
+    slots = build_slots(["0", "1"], base_port=8199, output_dir=str(tmp_path))
+    os.makedirs(slots[0]["output_dir"], exist_ok=True)
+    os.makedirs(slots[1]["output_dir"], exist_ok=True)
+    with open(os.path.join(slots[0]["output_dir"], "results.csv"), "w") as f:
+        f.write("policy,seed\nlru,1\n")
+    # slots[1] never produced a results.csv (every cell dispatched to it failed).
+
+    merged_path = merge_results(str(tmp_path), slots)
+
+    with open(merged_path) as f:
+        content = f.read()
+    assert "lru,1" in content
 
 
 def _write_lines(path, lines):

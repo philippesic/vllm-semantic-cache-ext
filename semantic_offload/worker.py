@@ -38,6 +38,7 @@ backend that doesn't match it, rather than silently producing wrong
 summaries. Does not apply to MLA (no per-head keys exist there at all).
 """
 
+import pickle
 import time
 
 import torch
@@ -247,11 +248,22 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         ranked = sorted(zip(keys, scores), key=lambda kv: kv[1], reverse=True)
         t3 = time.perf_counter()
         self._pending_scores.setdefault(self._method, {})[req_id] = ranked
+        # `ranked` holds ALL n_summaries candidates (truncating it is what
+        # caused the entries #29-31 splice-matching bug) -- it gets embedded
+        # whole into SemanticWorkerMetadata.pending_scores and crosses a
+        # real process boundary (worker -> scheduler) every step. None of
+        # the timing above can see that cost since it happens after this
+        # function returns -- measure pickling the same data shape directly
+        # as a stand-in for the real IPC serialization cost.
+        pickle_start = time.perf_counter()
+        payload = pickle.dumps(ranked)
+        pickle_ms = (time.perf_counter() - pickle_start) * 1000
         debug_print(
             f"SEMANTIC_STEP1_3_TIMING req={req_id} n_summaries={len(keys)} "
             f"rebuilt={rebuilt} rebuild_ms={(t1 - t0) * 1000:.2f} "
             f"score_ms={(t2 - t1) * 1000:.2f} sort_ms={(t3 - t2) * 1000:.2f} "
-            f"total_ms={(t3 - t0) * 1000:.2f}"
+            f"total_ms={(t3 - t0) * 1000:.2f} "
+            f"pickle_ms={pickle_ms:.2f} payload_bytes={len(payload)}"
         )
         debug_print(
             f"SEMANTIC_STEP1_3_DEBUG req={req_id} method={self._method} "

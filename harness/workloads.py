@@ -20,6 +20,9 @@ WORKLOAD_NAMES = (
     "longdoc",
 )  # "needle" and "mixed" are separate, see below
 
+RAG_NUM_PREFIXES = 10  # `--prefix-repetition-num-prefixes` below; `vllm bench
+# serve` requires num_requests >= this or it raises ValueError
+
 
 def get_args(
     workload: str,
@@ -72,7 +75,7 @@ def get_args(
             "--dataset-name",
             "prefix_repetition",
             "--prefix-repetition-num-prefixes",
-            "10",
+            str(RAG_NUM_PREFIXES),
             "--prefix-repetition-prefix-len",
             str(prefix_len),
             "--prefix-repetition-suffix-len",

@@ -240,6 +240,21 @@ def test_resolve_num_prompts_requires_one_of_the_two():
         resolve_num_prompts(2.0, None, None)
 
 
+def test_resolve_num_prompts_rejects_below_workload_minimum():
+    from benchmarks.run_latency_suite import resolve_num_prompts
+
+    # rate=0.15, duration=60s -> resolves to 9, below rag's num_prefixes floor
+    with pytest.raises(ValueError, match="minimum"):
+        resolve_num_prompts(0.15, None, 60.0, min_num_prompts=10)
+
+
+def test_resolve_num_prompts_allows_at_or_above_workload_minimum():
+    from benchmarks.run_latency_suite import resolve_num_prompts
+
+    assert resolve_num_prompts(0.15, None, 600.0, min_num_prompts=10) == 90
+    assert resolve_num_prompts(2.0, 10, None, min_num_prompts=10) == 10
+
+
 def test_grid_sweep_cell_args_include_seed_and_duration():
     from benchmarks.run_grid_sweep import build_run_latency_suite_args
 

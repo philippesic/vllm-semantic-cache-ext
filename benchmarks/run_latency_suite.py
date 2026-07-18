@@ -102,24 +102,43 @@ def parse_vllm_bench_result(result_json_path: str) -> dict:
 
 
 def resolve_num_prompts(
-    request_rate: float, num_prompts: int | None, target_duration_s: float | None
+    request_rate: float,
+    num_prompts: int | None,
+    target_duration_s: float | None,
+    min_num_prompts: int | None = None,
 ) -> int:
     """Pure, unit-testable: either an explicit --num-prompts, or a count
     derived from a target steady-state duration at the given request rate
     (--target-duration-s) -- a flat --num-prompts produces very different
     steady-state windows at different arrival rates, which the plan's own
     protocol (>=10 min steady-state per configuration) doesn't allow (see
-    the Step 1.6 grid-trim proposal's follow-up #2)."""
+    the Step 1.6 grid-trim proposal's follow-up #2).
+
+    `min_num_prompts`: some datasets have their own hard floor (e.g. `rag`'s
+    `prefix_repetition` needs num_requests >= num_prefixes,
+    `workloads.RAG_NUM_PREFIXES`) that a derived count can silently fall
+    below at a low rate/short duration -- raise here, before launching
+    `vllm bench serve`, instead of letting that cell crash with a
+    less legible error deep inside the benchmark subprocess."""
     if target_duration_s is not None:
         if request_rate == float("inf"):
             raise ValueError(
                 "--target-duration-s requires a finite --request-rate "
                 "(inf sends everything at t=0, duration is undefined)"
             )
-        return max(1, round(target_duration_s * request_rate))
-    if num_prompts is not None:
-        return num_prompts
-    raise ValueError("either --num-prompts or --target-duration-s is required")
+        resolved = max(1, round(target_duration_s * request_rate))
+    elif num_prompts is not None:
+        resolved = num_prompts
+    else:
+        raise ValueError("either --num-prompts or --target-duration-s is required")
+    if min_num_prompts is not None and resolved < min_num_prompts:
+        raise ValueError(
+            f"resolved num_prompts ({resolved}) is below this workload's "
+            f"minimum ({min_num_prompts}) at request_rate={request_rate}, "
+            f"num_prompts={num_prompts}, target_duration_s={target_duration_s} "
+            "-- raise --target-duration-s or --num-prompts for this cell"
+        )
+    return resolved
 
 
 def run_vllm_bench_serve(
@@ -198,6 +217,16 @@ def run_mixed_case(
             f"raw_{policy}_mixed-{sub_workload}_{rate}_{_seed_tag(seed)}.json",
         )
         try:
+            if (
+                sub_workload == "rag"
+                and sub_num_prompts < workloads_mod.RAG_NUM_PREFIXES
+            ):
+                raise ValueError(
+                    f"mixed's rag sub-stream num_prompts ({sub_num_prompts}, "
+                    f"{resolved_num_prompts}*{weight} weight) is below "
+                    f"RAG_NUM_PREFIXES ({workloads_mod.RAG_NUM_PREFIXES}) -- "
+                    "raise the overall --num-prompts/--target-duration-s"
+                )
             row = run_vllm_bench_serve(
                 base_url,
                 model,
@@ -493,7 +522,12 @@ def main():
                     else:
                         for rate in request_rates:
                             resolved_num_prompts = resolve_num_prompts(
-                                rate, args.num_prompts, args.target_duration_s
+                                rate,
+                                args.num_prompts,
+                                args.target_duration_s,
+                                min_num_prompts=workloads_mod.RAG_NUM_PREFIXES
+                                if workload == "rag"
+                                else None,
                             )
                             try:
                                 before = metrics_mod.snapshot(handle.metrics_url())

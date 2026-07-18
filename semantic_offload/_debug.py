@@ -17,6 +17,25 @@ ENABLED = os.environ.get("SEMANTIC_OFFLOAD_DEBUG", "") not in (
     "False",
 )
 
+# TEMPORARY diagnostic toggle (issues log entry #53's follow-up): a real
+# B200 run showed semantic-minmax causing MORE GPU preemptions than lru
+# under an identical, tight-capacity config (17 vs 5), and each preempted
+# request's real readmission wait (hundreds of ms to ~1.6s) accounts for
+# most of the measured TTFT gap. Leading hypothesis: the prefetch/
+# reservation mechanism speculatively holds GPU blocks aside for preempted
+# requests, taking capacity away from currently-running ones and causing
+# more preemptions than would happen without it. Set
+# SEMANTIC_OFFLOAD_DISABLE_PREFETCH=1 to test that directly -- makes
+# on_request_preempted a no-op (matching the base KVConnectorBase_V1
+# default lru gets), so requests only ever resolve via normal vLLM
+# readmission, with scoring still fully active. Remove once confirmed.
+DISABLE_PREFETCH = os.environ.get("SEMANTIC_OFFLOAD_DISABLE_PREFETCH", "") not in (
+    "",
+    "0",
+    "false",
+    "False",
+)
+
 
 def debug_print(*args, **kwargs) -> None:
     if ENABLED:

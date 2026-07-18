@@ -363,6 +363,31 @@ def test_on_request_preempted_never_reserves_synchronously():
     assert "r1" not in sched._prefetched  # not reserved yet, despite free blocks
 
 
+def test_on_request_preempted_is_noop_when_prefetch_disabled():
+    """SEMANTIC_OFFLOAD_DISABLE_PREFETCH (issues log entry #53's follow-up,
+    diagnosing whether prefetch's speculative block reservation is itself
+    causing extra preemptions under tight capacity): with the flag on,
+    on_request_preempted must match the base KVConnectorBase_V1 no-op lru
+    gets -- nothing queued, nothing tracked."""
+    from unittest.mock import patch
+
+    import semantic_offload.connector as connector_mod
+
+    manager = SemanticOffloadingManager(num_blocks=10)
+    key = to_key(1)
+    _insert_resident(manager, key, block_id=0)
+    manager.relevance_ema.setdefault("minmax", {})[key] = 1.0
+    sched = _make_connector_scheduler(manager, _StubBlockPool(20, free_blocks=5))
+    _add_req_status(sched, "r1", keys=[key])
+
+    with patch.object(connector_mod, "_DISABLE_PREFETCH", True):
+        sched.on_request_preempted(SimpleNamespace(request_id="r1"))
+
+    assert sched._preempted_pending == set()
+    assert sched._preempted_at == {}
+    assert sched._retry_attempts == {}
+
+
 def test_retry_pending_prefetches_skips_requests_preempted_this_step():
     """issues log entry #27 (Fix B): a request preempted THIS scheduling
     step must not be attempted even during the retry sweep -- it only

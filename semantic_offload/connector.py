@@ -26,6 +26,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from semantic_offload._debug import DISABLE_PREFETCH as _DISABLE_PREFETCH
 from semantic_offload._debug import ENABLED as _DEBUG_ENABLED
 from semantic_offload._debug import debug_print
 from vllm.config import VllmConfig
@@ -213,6 +214,8 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         engine -- not yet observed live only because the tested workloads
         happened to never have free blocks at the preemption instant
         itself (issues log entry #24), not because it can't happen."""
+        if _DISABLE_PREFETCH:
+            return
         self._preempted_pending.add(request.request_id)
         self._preempted_at[request.request_id] = time.monotonic()
         self._retry_attempts[request.request_id] = 0

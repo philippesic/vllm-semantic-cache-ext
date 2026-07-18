@@ -62,14 +62,25 @@ def launch_server(
     kv_transfer_config: dict | None = None,
     extra_args: list[str] | None = None,
     ready_timeout_s: float = 180.0,
+    log_label: str | None = None,
 ) -> ServerHandle:
     """Launch a real `vllm serve` subprocess and block until /health is 200
     (or raise TimeoutError). Caller must call .shutdown() when done -- no
     context-manager wrapper here so callers can decide whether a failed run
     should still tear the server down (yes, always) or leave it up for
-    manual inspection (deliberately opt-in, not the default)."""
+    manual inspection (deliberately opt-in, not the default).
+
+    `log_label` (e.g. a policy name) plus a wall-clock timestamp make the
+    log filename unique per call -- a benchmark grid reuses the same port
+    across many sequential launches, and a bare `server_{port}.log`
+    opened in write mode silently overwrote every earlier run's log,
+    losing the ability to debug any but the last one (found during real-
+    server validation of this harness)."""
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, f"server_{port}.log")
+    label = f"{log_label}_" if log_label else ""
+    log_path = os.path.join(
+        log_dir, f"server_{label}{port}_{int(time.time() * 1000)}.log"
+    )
 
     cmd = [
         "vllm",

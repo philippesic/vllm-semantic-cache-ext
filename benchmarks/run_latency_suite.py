@@ -159,6 +159,7 @@ def main():
                     max_model_len=args.max_model_len,
                     num_gpu_blocks_override=args.num_gpu_blocks_override,
                     kv_transfer_config=kv_config,
+                    log_label=policy,
                 )
             except (RuntimeError, TimeoutError) as e:
                 print(f"policy={policy} FAILED TO LAUNCH: {e}", flush=True)

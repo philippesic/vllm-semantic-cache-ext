@@ -80,6 +80,27 @@ def parse_vllm_bench_result(result_json_path: str) -> dict:
     }
 
 
+def resolve_num_prompts(
+    request_rate: float, num_prompts: int | None, target_duration_s: float | None
+) -> int:
+    """Pure, unit-testable: either an explicit --num-prompts, or a count
+    derived from a target steady-state duration at the given request rate
+    (--target-duration-s) -- a flat --num-prompts produces very different
+    steady-state windows at different arrival rates, which the plan's own
+    protocol (>=10 min steady-state per configuration) doesn't allow (see
+    the Step 1.6 grid-trim proposal's follow-up #2)."""
+    if target_duration_s is not None:
+        if request_rate == float("inf"):
+            raise ValueError(
+                "--target-duration-s requires a finite --request-rate "
+                "(inf sends everything at t=0, duration is undefined)"
+            )
+        return max(1, round(target_duration_s * request_rate))
+    if num_prompts is not None:
+        return num_prompts
+    raise ValueError("either --num-prompts or --target-duration-s is required")
+
+
 def run_vllm_bench_serve(
     base_url: str,
     model: str,
@@ -88,6 +109,7 @@ def run_vllm_bench_serve(
     request_rate: float,
     scale: float,
     result_path: str,
+    seed: int | None = None,
 ) -> dict:
     args = workloads_mod.get_args(
         workload, num_prompts=num_prompts, request_rate=request_rate, scale=scale
@@ -106,6 +128,8 @@ def run_vllm_bench_serve(
         os.path.dirname(result_path),
         *args,
     ]
+    if seed is not None:
+        cmd += ["--seed", str(seed)]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     if proc.returncode != 0:
         return {"error": f"vllm bench serve failed: {proc.stderr[-2000:]}"}
@@ -123,7 +147,33 @@ def main():
     parser.add_argument(
         "--needle-reference-counts", default="0,1,2", help="comma-separated"
     )
-    parser.add_argument("--num-prompts", type=int, default=20)
+    parser.add_argument(
+        "--num-prompts",
+        type=int,
+        default=None,
+        help="flat request count per run; mutually exclusive with --target-duration-s",
+    )
+    parser.add_argument(
+        "--target-duration-s",
+        type=float,
+        default=None,
+        help=(
+            "derive num_prompts as target_duration_s * request_rate per "
+            "(workload, rate) cell, so every cell gets the same steady-state "
+            "window instead of a flat prompt count producing very different "
+            "durations at different arrival rates (plan protocol: >=10 min)"
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "single seed for this invocation's `vllm bench serve` calls "
+            "(passed through as-is); a multi-seed sweep loops this whole "
+            "script once per seed, see benchmarks/run_grid_sweep.py"
+        ),
+    )
     parser.add_argument("--scale", type=float, default=1.0)
     parser.add_argument("--cpu-bytes-to-use", type=int, default=2 * 1024**3)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
@@ -132,6 +182,11 @@ def main():
     parser.add_argument("--port", type=int, default=8199)
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
+
+    if args.num_prompts is None and args.target_duration_s is None:
+        parser.error("one of --num-prompts or --target-duration-s is required")
+    if args.num_prompts is not None and args.target_duration_s is not None:
+        parser.error("--num-prompts and --target-duration-s are mutually exclusive")
 
     os.makedirs(args.output_dir, exist_ok=True)
     csv_path = os.path.join(args.output_dir, "results.csv")
@@ -167,6 +222,15 @@ def main():
                 csv_file.flush()
                 continue
 
+            # needle isn't rate-based, so --target-duration-s doesn't map
+            # onto it the same way -- fall back to a rough ~15s/distractor
+            # estimate when only a duration was given, matching this
+            # project's own needle-case latency scale (issues log entries
+            # #33/#35).
+            needle_num_prompts = args.num_prompts or max(
+                1, round(args.target_duration_s / 15)
+            )
+
             try:
                 for workload in workloads:
                     if workload == "needle":
@@ -175,7 +239,7 @@ def main():
                             result = needle_workload.run_needle_case(
                                 handle.base_url(),
                                 reference_count=ref_count,
-                                num_distractors=max(1, args.num_prompts - ref_count),
+                                num_distractors=max(1, needle_num_prompts - ref_count),
                                 model=args.model,
                                 seed=ref_count,
                             )
@@ -204,6 +268,9 @@ def main():
                             csv_file.flush()
                     else:
                         for rate in request_rates:
+                            resolved_num_prompts = resolve_num_prompts(
+                                rate, args.num_prompts, args.target_duration_s
+                            )
                             before = metrics_mod.snapshot(handle.metrics_url())
                             result_path = os.path.join(
                                 args.output_dir,
@@ -213,10 +280,11 @@ def main():
                                 handle.base_url(),
                                 args.model,
                                 workload,
-                                args.num_prompts,
+                                resolved_num_prompts,
                                 rate,
                                 args.scale,
                                 result_path,
+                                seed=args.seed,
                             )
                             after = metrics_mod.snapshot(handle.metrics_url())
                             delta = metrics_mod.diff(before, after)
@@ -225,7 +293,7 @@ def main():
                                     "policy": policy,
                                     "workload": workload,
                                     "request_rate": rate,
-                                    "num_prompts": args.num_prompts,
+                                    "num_prompts": resolved_num_prompts,
                                     "load_bytes_delta": delta.get(
                                         "vllm:kv_offload_load_bytes_total"
                                     ),

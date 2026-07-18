@@ -137,3 +137,86 @@ def test_parse_vllm_bench_result_extracts_expected_fields():
         assert row["throughput_tok_s"] == 100.0
     finally:
         os.unlink(path)
+
+
+def test_resolve_num_prompts_from_target_duration():
+    from benchmarks.run_latency_suite import resolve_num_prompts
+
+    assert resolve_num_prompts(2.0, None, 30.0) == 60
+    assert resolve_num_prompts(2.0, None, 1.0) == 2
+
+
+def test_resolve_num_prompts_explicit_num_prompts_wins_when_given():
+    from benchmarks.run_latency_suite import resolve_num_prompts
+
+    assert resolve_num_prompts(2.0, 15, None) == 15
+
+
+def test_resolve_num_prompts_rejects_infinite_rate_with_target_duration():
+    from benchmarks.run_latency_suite import resolve_num_prompts
+
+    with pytest.raises(ValueError):
+        resolve_num_prompts(float("inf"), None, 30.0)
+
+
+def test_resolve_num_prompts_requires_one_of_the_two():
+    from benchmarks.run_latency_suite import resolve_num_prompts
+
+    with pytest.raises(ValueError):
+        resolve_num_prompts(2.0, None, None)
+
+
+def test_grid_sweep_cell_args_include_seed_and_duration():
+    from benchmarks.run_grid_sweep import build_run_latency_suite_args
+
+    args = build_run_latency_suite_args(
+        model="m",
+        policy="semantic-mean",
+        workloads="chat,rag",
+        request_rates="2.0,8.0",
+        needle_reference_counts="0,1",
+        target_duration_s=600.0,
+        num_prompts=None,
+        scale=1.0,
+        cpu_bytes_to_use=1000,
+        gpu_memory_utilization=0.5,
+        max_model_len=2048,
+        num_gpu_blocks_override=200,
+        port=8199,
+        seed=3,
+        output_dir="/tmp/out",
+    )
+    assert (
+        "--policies" in args and args[args.index("--policies") + 1] == "semantic-mean"
+    )
+    assert "--seed" in args and args[args.index("--seed") + 1] == "3"
+    assert (
+        "--target-duration-s" in args
+        and args[args.index("--target-duration-s") + 1] == "600.0"
+    )
+    assert "--num-prompts" not in args  # mutually exclusive with target-duration-s
+
+
+def test_grid_sweep_cell_args_use_num_prompts_when_no_duration_given():
+    from benchmarks.run_grid_sweep import build_run_latency_suite_args
+
+    args = build_run_latency_suite_args(
+        model="m",
+        policy="lru",
+        workloads="chat",
+        request_rates="2.0",
+        needle_reference_counts="0",
+        target_duration_s=None,
+        num_prompts=20,
+        scale=1.0,
+        cpu_bytes_to_use=1000,
+        gpu_memory_utilization=0.5,
+        max_model_len=2048,
+        num_gpu_blocks_override=None,
+        port=8199,
+        seed=1,
+        output_dir="/tmp/out",
+    )
+    assert "--num-prompts" in args and args[args.index("--num-prompts") + 1] == "20"
+    assert "--target-duration-s" not in args
+    assert "--num-gpu-blocks-override" not in args

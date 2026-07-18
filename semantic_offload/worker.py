@@ -40,6 +40,7 @@ summaries. Does not apply to MLA (no per-head keys exist there at all).
 
 import torch
 
+from semantic_offload._debug import debug_print
 from semantic_offload.index import (
     BlockSummary,
     build_summary,
@@ -171,12 +172,11 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
                 reverse=True,
             )
             self._pending_scores.setdefault(method, {})[req_id] = ranked
-            print(
+            debug_print(
                 f"SEMANTIC_STEP1_3_DEBUG req={req_id} method={method} "
                 f"n_summaries={len(self.durable_summaries)} "
                 f"ranked_keys={[k.hex()[:8] for k, _ in ranked]} "
-                f"scores={[round(s, 4) for _, s in ranked]}",
-                flush=True,
+                f"scores={[round(s, 4) for _, s in ranked]}"
             )
 
     def _check_layout(self, layer_name: str, layer, kv_cache: torch.Tensor) -> None:
@@ -247,10 +247,9 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         ]
         if not block_summaries:
             return
-        print(
+        debug_print(
             f"SEMANTIC_STEP1_3_DEBUG store job={job_id} "
-            f"keys={[k.hex()[:8] for k in keys]} block_ids={list(block_ids)}",
-            flush=True,
+            f"keys={[k.hex()[:8] for k in keys]} block_ids={list(block_ids)}"
         )
         if len(block_summaries) == len(keys):
             for key, summary in zip(keys, block_summaries):

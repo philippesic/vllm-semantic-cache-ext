@@ -25,6 +25,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from semantic_offload._debug import debug_print
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
@@ -323,9 +324,8 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         self._prefetched[req_id] = _PrefetchState(
             job_id=job_id, keys=resident_keys, gpu_block_ids=gpu_block_ids
         )
-        print(
-            f"PREFETCH_EFFECT_DEBUG RESERVED req={req_id} n={n} job_id={job_id}",
-            flush=True,
+        debug_print(
+            f"PREFETCH_EFFECT_DEBUG RESERVED req={req_id} n={n} job_id={job_id}"
         )
         return True
 
@@ -459,10 +459,9 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         prefetch = self._prefetched.get(request.request_id)
         if prefetch is None:
             return False
-        print(
+        debug_print(
             f"PREFETCH_EFFECT_DEBUG {request.request_id}: prefetch exists at "
-            f"re-admission, attempting splice",
-            flush=True,
+            f"re-admission, attempting splice"
         )
         # issues log entry #28: `job_status is None` does NOT mean "not
         # ready" -- it means the OPPOSITE. Reaching this method at all (with
@@ -483,10 +482,9 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         # harmless to keep checking).
         job_status = self._jobs.get(prefetch.job_id)
         if job_status is not None and job_status.pending_count > 0:
-            print(
+            debug_print(
                 f"PREFETCH_EFFECT_DEBUG {request.request_id}: NOT READY "
-                f"(job_status={job_status})",
-                flush=True,
+                f"(job_status={job_status})"
             )
             return False  # prefetch load hasn't completed yet
 
@@ -519,11 +517,10 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
                 remainder_dst.append(dst)
 
         if not splice_src:
-            print(
+            debug_print(
                 f"PREFETCH_EFFECT_DEBUG {request.request_id}: KEY MISMATCH "
                 f"spliced=0 keys_to_load={len(keys_to_load)} "
-                f"prefetch.keys={len(prefetch.keys)}",
-                flush=True,
+                f"prefetch.keys={len(prefetch.keys)}"
             )
             return False  # nothing usable here; normal path loads everything
 
@@ -591,11 +588,10 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         if req_status.offloading_context.policy == OffloadPolicy.BLOCK_LEVEL:
             group_state.next_stored_block_idx = num_blocks
         covered = len(splice_dst) / (len(splice_dst) + len(remainder_dst))
-        print(
+        debug_print(
             f"PREFETCH_EFFECT_DEBUG {request.request_id}: PARTIAL SPLICE "
             f"spliced={len(splice_dst)} reloaded={len(remainder_dst)} "
-            f"covered={covered:.2f}",
-            flush=True,
+            f"covered={covered:.2f}"
         )
         return True
 
@@ -615,10 +611,9 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         # handled above) -- the normal path below will load everything
         # itself, making the stale prefetch redundant.
         if request.request_id in self._prefetched:
-            print(
+            debug_print(
                 f"PREFETCH_EFFECT_DEBUG {request.request_id}: STALE, released "
-                f"unspliced, falling back to normal load",
-                flush=True,
+                f"unspliced, falling back to normal load"
             )
             self._release_prefetch(request.request_id)
         super().update_state_after_alloc(request, blocks, num_external_tokens)

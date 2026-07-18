@@ -30,6 +30,7 @@ from collections.abc import Callable
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from semantic_offload._debug import debug_print
 from vllm.config import VllmConfig
 from vllm.utils.torch_utils import _resolve_layer_name
 
@@ -105,12 +106,11 @@ def install(
                     else None
                 )
                 if resolved_name == probe_layer_name:
-                    print(
+                    debug_print(
                         "SEMANTIC_QUERY_CAPTURE_DEBUG "
                         f"query_shape0={query.shape[0] if query is not None else None} "
                         f"layout_num_tokens={layout.num_tokens if layout else None} "
-                        f"layout_req_ids={layout.req_ids if layout else None}",
-                        flush=True,
+                        f"layout_req_ids={layout.req_ids if layout else None}"
                     )
                 if (
                     layout is not None

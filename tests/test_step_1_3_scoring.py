@@ -21,6 +21,7 @@ def _make_worker(method: str = "minmax") -> SemanticOffloadingWorker:
     worker.summaries = {"layer0": {}}
     worker._pending_job_keys = {}
     worker.durable_summaries = {}
+    worker._max_durable_summaries = 10_000  # effectively unbounded for these tests
     worker._pending_scores = {}
     worker._method = method
     worker._stack_cache_dirty = True
@@ -78,6 +79,61 @@ def test_durably_key_summaries_no_job_keys_is_noop():
     worker.summaries["layer0"][1] = [_summary(1.0)]
     worker._durably_key_summaries(123, [1])  # job_id never registered
     assert worker.durable_summaries == {}
+
+
+def test_durably_key_summaries_prunes_oldest_past_cap():
+    """Regression for issues log entries #62/#63: `durable_summaries` grew
+    without bound (nothing ever pruned it), and re-stacking the whole thing
+    on every store measurably became a quadratic-cost bug at real 7B/B200
+    scale. Bound it to `_max_durable_summaries` (the real CPU tier's block
+    capacity), FIFO-by-insertion-order."""
+    worker = _make_worker()
+    worker._max_durable_summaries = 2
+    for i in range(4):
+        worker.summaries["layer0"][i] = [_summary(float(i))]
+        key = to_key(i)
+        worker.receive_job_keys({i: [key]})
+        worker._durably_key_summaries(i, [i])
+
+    assert len(worker.durable_summaries) == 2
+    # The two most-recently-inserted keys survive; the oldest two were
+    # pruned first, not an arbitrary subset.
+    assert set(worker.durable_summaries) == {to_key(2), to_key(3)}
+
+
+def test_receive_evicted_keys_drops_exactly_those_keys():
+    """Regression for issues log entries #62-64: the real fix. A block the
+    manager reports as evicted must be dropped from durable_summaries
+    immediately and precisely -- unlike the FIFO cap, a key NOT reported as
+    evicted must survive no matter how old it is (the FIFO cap's own known
+    failure mode: pruning still-resident, important content just because
+    it's old)."""
+    worker = _make_worker()
+    worker._max_durable_summaries = 10_000
+    for i in range(3):
+        worker.summaries["layer0"][i] = [_summary(float(i))]
+        key = to_key(i)
+        worker.receive_job_keys({i: [key]})
+        worker._durably_key_summaries(i, [i])
+    assert set(worker.durable_summaries) == {to_key(0), to_key(1), to_key(2)}
+    worker._stack_cache_dirty = False
+
+    worker.receive_evicted_keys([to_key(0), to_key(2)])
+
+    assert set(worker.durable_summaries) == {to_key(1)}
+    assert worker._stack_cache_dirty is True  # a real removal happened
+
+
+def test_receive_evicted_keys_no_match_is_noop():
+    worker = _make_worker()
+    worker._max_durable_summaries = 10_000
+    worker.durable_summaries[to_key(1)] = [_summary(1.0)]
+    worker._stack_cache_dirty = False
+
+    worker.receive_evicted_keys([to_key(99)])  # never resident
+
+    assert set(worker.durable_summaries) == {to_key(1)}
+    assert worker._stack_cache_dirty is False  # nothing actually removed
 
 
 def test_on_query_captured_ranks_needle_highest_only_for_configured_method():

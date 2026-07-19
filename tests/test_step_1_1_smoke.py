@@ -194,6 +194,20 @@ def test_semantic_manager_matches_lru_manager_behavior():
     assert semantic_evicted is not None
 
 
+def test_prepare_store_evictions_are_drainable():
+    """Regression for issues log entries #62-64: prepare_store() must
+    surface the base CPUOffloadingManager's own PrepareStoreOutput.
+    evicted_keys via drain_evicted_keys(), so the worker can learn exactly
+    which blocks were evicted instead of approximating with a FIFO cap.
+    drain_evicted_keys() must also clear its buffer once read."""
+    manager = SemanticOffloadingManager(num_blocks=4)
+    result = _run_scenario(manager)
+
+    assert result  # the scenario forces a real eviction
+    assert manager.drain_evicted_keys() == result
+    assert manager.drain_evicted_keys() == []  # drained, not re-readable
+
+
 def test_semantic_manager_method_is_selectable():
     """issues log entry #34: `method` used to be hardcoded to
     manager.py's _DEFAULT_METHOD with no way to select a different scoring

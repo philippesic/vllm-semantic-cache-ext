@@ -9,8 +9,12 @@ policy instance afterward. See .claude/docs/semantic-eviction-plan.md,
 Step 1.1.
 """
 
+from collections.abc import Collection
+
+from typing_extensions import override
+
 from semantic_offload.policy import SemanticPolicy
-from vllm.v1.kv_offload.base import OffloadKey
+from vllm.v1.kv_offload.base import OffloadKey, PrepareStoreOutput, ReqContext
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
 _EMA_ALPHA = 0.3  # ceiling weight on the newest observation; see update_relevance
@@ -53,6 +57,12 @@ class SemanticOffloadingManager(CPUOffloadingManager):
         # Passed into SemanticPolicy by reference -- update_relevance()
         # mutates this dict in place and evict() reads it live (Step 1.4).
         self.relevance_ema: dict[str, dict[OffloadKey, float]] = {}
+        # Real eviction notifications for the worker's durable_summaries
+        # (issues log entries #62-64) -- see prepare_store() below. Drained
+        # by SemanticOffloadingConnectorScheduler.build_connector_meta()
+        # each step, the same accumulate-then-drain pattern already used for
+        # _pending_job_keys.
+        self._pending_evicted_keys: list[OffloadKey] = []
         self._policy = SemanticPolicy(
             cache_capacity=num_blocks,
             relevance_ema=self.relevance_ema,
@@ -64,6 +74,34 @@ class SemanticOffloadingManager(CPUOffloadingManager):
             session_aware=session_aware,
             session_bonus_half_life=session_bonus_half_life,
         )
+
+    @override
+    def prepare_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> PrepareStoreOutput | None:
+        """Wraps the base CPUOffloadingManager.prepare_store() purely to
+        observe `PrepareStoreOutput.evicted_keys` -- the base class already
+        computes exactly which keys the real CachePolicy just evicted to
+        make room for this store (manager.py's own `evict()` call), it just
+        never surfaced that anywhere. Buffered here (scheduler-side) and
+        drained by the connector scheduler into per-step metadata, mirroring
+        _pending_job_keys' accumulate-then-drain pattern, so the worker can
+        learn precisely which blocks are gone instead of approximating with
+        a FIFO cap (issues log entries #62-64 -- that cap remains as a
+        defensive backstop in worker.py, not the primary mechanism anymore)."""
+        result = super().prepare_store(keys, req_context)
+        if result is not None and result.evicted_keys:
+            self._pending_evicted_keys.extend(result.evicted_keys)
+        return result
+
+    def drain_evicted_keys(self) -> list[OffloadKey]:
+        """Pop and return all evicted keys accumulated since the last drain
+        (per-step, from SemanticOffloadingConnectorScheduler.build_connector_meta)."""
+        keys = self._pending_evicted_keys
+        self._pending_evicted_keys = []
+        return keys
 
     def update_relevance(
         self, scores: dict[str, dict[str, list[tuple[OffloadKey, float]]]]

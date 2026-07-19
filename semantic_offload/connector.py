@@ -107,6 +107,10 @@ class SemanticOffloadingConnectorMetadata(OffloadingConnectorMetadata):
     # req_id -> (src GPU block ids holding prefetched data, dst GPU block
     # ids the scheduler just officially allocated for the same keys).
     splice_jobs: dict[str, tuple[list[int], list[int]]] = field(default_factory=dict)
+    # Real evictions the manager's CachePolicy made this step (issues log
+    # entries #62-64) -- lets the worker drop exactly these keys from
+    # durable_summaries instead of approximating with a FIFO cap.
+    evicted_keys: list[OffloadKey] = field(default_factory=list)
     # issues log entry #27: prefetch loads are dispatched through a SEPARATE
     # channel from `load_jobs`, not merged into it. The stock worker's
     # start_kv_transfers() registers every job in `load_jobs` into
@@ -665,6 +669,9 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         self._pending_splice_jobs = {}
         prefetch_load_jobs = self._current_batch_prefetch_load_jobs
         self._current_batch_prefetch_load_jobs = {}
+        evicted_keys: list[OffloadKey] = []
+        if hasattr(self.manager, "drain_evicted_keys"):
+            evicted_keys = self.manager.drain_evicted_keys()
         return SemanticOffloadingConnectorMetadata(
             load_jobs=base_meta.load_jobs,
             store_jobs=base_meta.store_jobs,
@@ -672,6 +679,7 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
             store_job_keys=job_keys,
             splice_jobs=splice_jobs,
             prefetch_load_jobs=prefetch_load_jobs,
+            evicted_keys=evicted_keys,
         )
 
 
@@ -745,6 +753,8 @@ class SemanticOffloadingConnector(OffloadingConnector):
             worker = self.connector_worker.worker
             if hasattr(worker, "receive_job_keys"):
                 worker.receive_job_keys(connector_metadata.store_job_keys)
+            if hasattr(worker, "receive_evicted_keys"):
+                worker.receive_evicted_keys(connector_metadata.evicted_keys)
             if hasattr(worker, "splice_gpu_blocks"):
                 # Runs before super().bind_connector_metadata() below (which
                 # hands off the load_jobs that would otherwise redundantly

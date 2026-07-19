@@ -38,6 +38,7 @@ backend that doesn't match it, rather than silently producing wrong
 summaries. Does not apply to MLA (no per-head keys exist there at all).
 """
 
+import itertools
 import time
 
 import torch
@@ -119,6 +120,20 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         # One BlockSummary per KV head (not averaged across heads -- see
         # issues log entry #9; entry #7's pooled-average version is
         # superseded).
+        #
+        # DEFENSIVE BACKSTOP, not the primary mechanism anymore (issues log
+        # entries #62-64): receive_evicted_keys() now gets told precisely
+        # which keys the real CachePolicy evicted, each step, and removes
+        # exactly those -- the correct fix. This FIFO-by-insertion-order cap
+        # was the original stopgap (bounds the unbounded growth but can
+        # diverge from the manager's real eviction order, e.g. dropping a
+        # block the real tier still holds); it's kept only to bound worst-
+        # case growth from any removal path receive_evicted_keys doesn't yet
+        # cover (a failed store's cleanup, or a full cache reset -- both
+        # rare relative to the normal evict() path this now handles
+        # precisely). Should rarely-to-never trigger in practice once
+        # receive_evicted_keys is wired up correctly.
+        self._max_durable_summaries = max(num_cpu_blocks, 1)
         self.durable_summaries: dict[OffloadKey, list[BlockSummary]] = {}
         self._pending_job_keys: dict[int, list[OffloadKey]] = {}
         self._pending_scores: dict[str, dict[str, list[tuple[OffloadKey, float]]]] = {}
@@ -152,6 +167,28 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         job_id represents (scheduler-side info the worker has no other way
         to see -- see connector.py and the issues log entry #6/7)."""
         self._pending_job_keys.update(store_job_keys)
+
+    def receive_evicted_keys(self, evicted_keys: list[OffloadKey]) -> None:
+        """Called by SemanticOffloadingConnector with exactly the keys the
+        manager's real CachePolicy evicted this step (issues log entries
+        #62-64) -- the precise fix for durable_summaries' unbounded growth.
+        Replaces the FIFO cap (`_prune_durable_summaries`) as the primary
+        mechanism; that cap stays as a defensive backstop for any removal
+        path this doesn't cover (known gap: a failed store's cleanup in the
+        manager's complete_store(), and reset_cache()'s full clear -- both
+        rare relative to the evict() path that dominated the growth, not
+        yet wired through)."""
+        if not evicted_keys:
+            return
+        removed = [
+            k for k in evicted_keys if self.durable_summaries.pop(k, None) is not None
+        ]
+        if removed:
+            self._stack_cache_dirty = True
+        debug_print(
+            f"SEMANTIC_EVICT_DEBUG received={len(evicted_keys)} "
+            f"removed={len(removed)} resident={len(self.durable_summaries)}"
+        )
 
     def pop_pending_scores(
         self,
@@ -345,7 +382,21 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
             # proxy for all of its keys rather than dropping the signal.
             for key in keys:
                 self.durable_summaries[key] = block_summaries[-1]
+        self._prune_durable_summaries()
         self._stack_cache_dirty = True
+
+    def _prune_durable_summaries(self) -> None:
+        """Bound `durable_summaries` to (approximately) the real CPU tier's
+        capacity -- see the `_max_durable_summaries` comment in __init__ for
+        why this exists and its known imprecision. Evicts oldest-inserted
+        first: plain dicts preserve insertion order, so this needs no extra
+        bookkeeping, and insertion order is a reasonable proxy for "still
+        resident" absent a real eviction signal."""
+        overflow = len(self.durable_summaries) - self._max_durable_summaries
+        if overflow <= 0:
+            return
+        for key in list(itertools.islice(self.durable_summaries, overflow)):
+            del self.durable_summaries[key]
 
     def submit_store(
         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec

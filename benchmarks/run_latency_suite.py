@@ -75,6 +75,26 @@ RESULT_FIELDS = [
     "error",
 ]
 
+
+def check_existing_schema(csv_path: str) -> None:
+    """A stale results.csv from an older RESULT_FIELDS schema (e.g. before
+    needle-v2 added needle_outcome/recall_load_bytes/recall_store_bytes)
+    silently appending under a shorter existing header produced rows wider
+    than the file's own header line -- undetected until a later grid-sweep
+    merge crashed reading it back. Fail fast on append instead: call this
+    before appending to an existing results.csv, never on a fresh one."""
+    with open(csv_path, newline="") as existing:
+        existing_header = next(csv.reader(existing), [])
+    if existing_header != RESULT_FIELDS:
+        raise ValueError(
+            f"{csv_path} already exists with a different schema than the "
+            f"current RESULT_FIELDS -- refusing to append (would produce a "
+            f"corrupt/unmergeable CSV). Existing header: {existing_header}. "
+            f"Current RESULT_FIELDS: {RESULT_FIELDS}. Move or remove the "
+            f"stale file, or use a fresh --output-dir."
+        )
+
+
 # `mixed`: the plan's "headline workload" (§Benchmarking: "all four
 # interleaved") -- proportions chosen so chat/rag dominate (the realistic
 # high-arrival-rate and shared-prefix-reuse cases) with longdoc present at
@@ -372,6 +392,8 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     csv_path = os.path.join(args.output_dir, "results.csv")
     write_header = not os.path.exists(csv_path)
+    if not write_header:
+        check_existing_schema(csv_path)
 
     policies = args.policies.split(",")
     workloads = args.workloads.split(",")

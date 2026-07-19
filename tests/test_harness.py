@@ -412,6 +412,32 @@ def test_resolve_num_prompts_allows_at_or_above_workload_minimum():
     assert resolve_num_prompts(2.0, 10, None, min_num_prompts=10) == 10
 
 
+def test_check_existing_schema_accepts_matching_header(tmp_path):
+    from benchmarks.run_latency_suite import RESULT_FIELDS, check_existing_schema
+
+    csv_path = tmp_path / "results.csv"
+    csv_path.write_text(",".join(RESULT_FIELDS) + "\n")
+
+    check_existing_schema(str(csv_path))  # must not raise
+
+
+def test_check_existing_schema_rejects_stale_header(tmp_path):
+    """Regression: a step-1.6 grid-sweep run silently appended current-
+    schema rows under a pre-needle-v2 (3-columns-shorter) header left over
+    in an output dir from an older run, producing a file where later rows
+    had more fields than the header line -- undetected until the grid
+    sweep's merge step crashed reading it back (ValueError: dict contains
+    fields not in fieldnames: None). Must fail fast on append instead."""
+    from benchmarks.run_latency_suite import RESULT_FIELDS, check_existing_schema
+
+    csv_path = tmp_path / "results.csv"
+    stale_header = [f for f in RESULT_FIELDS if f != "needle_outcome"]
+    csv_path.write_text(",".join(stale_header) + "\n")
+
+    with pytest.raises(ValueError, match="different schema"):
+        check_existing_schema(str(csv_path))
+
+
 def test_grid_sweep_cell_args_include_seed_and_duration():
     from benchmarks.run_grid_sweep import build_run_latency_suite_args
 

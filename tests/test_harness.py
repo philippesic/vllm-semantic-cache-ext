@@ -126,6 +126,132 @@ def test_probe_prompts_are_distinct_across_a_real_case_size():
     assert len(set(probes)) == 5
 
 
+def test_long_distractors_differ_within_every_block_across_seeds():
+    """make_long_distractor must be distinct block-by-block across seeds, not
+    just as whole strings -- vLLM dedups by per-block content hash, so two
+    long distractors sharing any 16-token-aligned window collapse onto the
+    same stored block and stop building real CPU pressure (entry #57's
+    lesson, generalized from the first block to the whole prompt). Approx a
+    block as ~12 words and require every positional window to be unique
+    across a real case's worth of seeds."""
+    per_seed = [needle_workload.make_long_distractor(i).split() for i in range(12)]
+    assert all(len(w) >= 180 for w in per_seed)
+    for start in range(0, 180 - 12, 12):
+        windows = {tuple(w[start : start + 12]) for w in per_seed}
+        assert len(windows) == 12, f"block at word {start} collides across seeds"
+
+
+def test_classify_needle_outcome_hit_when_recall_loaded_from_cpu_tier():
+    """load_bytes > 0 means the needle's blocks were served straight from
+    the CPU tier -- the policy preserved them under pressure."""
+    assert (
+        needle_workload.classify_needle_outcome(917504.0, 0.0)
+        == needle_workload.NEEDLE_HIT
+    )
+
+
+def test_classify_needle_outcome_miss_when_recall_recomputed_and_restored():
+    """load_bytes == 0 but store_bytes > 0 means the blocks were absent from
+    both GPU and CPU tiers, so the recall had to recompute and re-store
+    them -- the policy evicted them. This is the exact case the old
+    `expected_code in recall_text` check could never see, since vLLM
+    recomputes the same (correct) answer regardless (issues log #58)."""
+    assert (
+        needle_workload.classify_needle_outcome(0.0, 3670016.0)
+        == needle_workload.NEEDLE_MISS
+    )
+
+
+def test_classify_needle_outcome_not_pressured_when_neither_counter_moved():
+    """load == store == 0 means the blocks were still resident in the GPU
+    prefix cache -- the CPU tier was never consulted, the run is not under
+    capacity pressure, and the result is uninterpretable. The built-in
+    validity check the old always-1.0 metric lacked."""
+    assert (
+        needle_workload.classify_needle_outcome(0.0, 0.0)
+        == needle_workload.NEEDLE_NOT_PRESSURED
+    )
+
+
+def test_classify_needle_outcome_prefers_hit_even_if_store_also_moved():
+    """A HIT can coincide with a small store (e.g. the recall's own trailing
+    question blocks): a positive load is decisive -- the needle's blocks did
+    come from the CPU tier."""
+    assert (
+        needle_workload.classify_needle_outcome(917504.0, 458752.0)
+        == needle_workload.NEEDLE_HIT
+    )
+
+
+def test_run_needle_v2_case_classifies_from_recall_isolated_deltas():
+    """run_needle_v2_case must snapshot metrics around the RECALL request
+    alone, so the outcome reflects the recall's own CPU-tier interaction and
+    not the distractors' store volume. Drives it with a fake HTTP client and
+    a fake, monotonic counter that advances only on the recall to prove the
+    isolation and the resulting classification."""
+    from unittest.mock import patch
+
+    calls = {"n": 0}
+
+    def fake_complete(base_url, model, prompt, max_tokens, timeout_s):
+        calls["n"] += 1
+        return "code is 12345-Zephyr", 0.01
+
+    # store rises during distractors, then load rises on the recall (a HIT):
+    # snapshots are taken by the drain (>=2), then before, then after recall.
+    load = {"v": 1000.0}
+
+    def fake_snapshot():
+        return {
+            "vllm:kv_offload_load_bytes_total": load["v"],
+            "vllm:kv_offload_store_bytes_total": 5000.0,
+        }
+
+    def bump_load_on_recall(base_url, model, prompt, max_tokens, timeout_s):
+        # the recall is the request whose prompt restates the needle +
+        # question; bump the load counter to simulate a CPU-tier hit.
+        if "Question:" in prompt:
+            load["v"] += 917504.0
+        return "code is 12345-Zephyr", 0.01
+
+    with patch.object(needle_workload, "_complete", side_effect=bump_load_on_recall):
+        result = needle_workload.run_needle_v2_case(
+            "http://x",
+            reference_count=0,
+            num_distractors=2,
+            model="m",
+            seed=0,
+            snapshot_metrics=fake_snapshot,
+            settle_s=0.0,
+            max_settle_polls=1,
+        )
+
+    assert result["needle_outcome"] == needle_workload.NEEDLE_HIT
+    assert result["recall_load_bytes"] == 917504.0
+
+
+def test_run_needle_v2_case_outcome_is_none_without_metrics_access():
+    """No snapshot callable -> no preservation signal; the case still runs
+    and returns latencies but reports needle_outcome=None rather than
+    guessing."""
+    from unittest.mock import patch
+
+    def fake_complete(base_url, model, prompt, max_tokens, timeout_s):
+        return "code is 12345-Zephyr", 0.01
+
+    with patch.object(needle_workload, "_complete", side_effect=fake_complete):
+        result = needle_workload.run_needle_v2_case(
+            "http://x",
+            reference_count=1,
+            num_distractors=2,
+            model="m",
+            seed=0,
+        )
+
+    assert result["needle_outcome"] is None
+    assert result["recall_load_bytes"] is None
+
+
 def test_metrics_parse_sums_across_label_combinations():
     text = """
 # HELP vllm:num_preemptions_total x

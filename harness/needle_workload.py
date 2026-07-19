@@ -9,14 +9,31 @@ entries #7-#14, #28-33's needle checks) as a reusable workload: plant a
 distinctive fact, let `reference_count` topically-similar probe requests
 touch it (0 = the structural cold-start case the plan expects to tie LRU,
 per entries #10-12), flood with `num_distractors` unrelated filler
-requests to build real eviction pressure, then recall the fact and check
-for an EXACT match -- not "looks plausible" (the single most important
-check this project's own history has learned to insist on, see issues log
-entry #33's flagged correctness-evidence gap).
+requests to build real eviction pressure, then recall the fact.
+
+Two recall-signal designs live here:
+
+  * `run_needle_case` -- the original, checks `expected_code in
+    recall_text`. Kept for the `mixed` workload's needle sub-stream and for
+    back-compat, but note (issues log entry #58): under vLLM's *lossless*
+    CPU-offload path that check is mathematically pinned to 1.0 for every
+    policy and tier size, because the recall restates the needle verbatim
+    and vLLM recomputes any evicted block to the same answer. It measures
+    that generation works, not that eviction preserved anything.
+
+  * `run_needle_v2_case` -- the preservation-aware design. Same sequence,
+    but the signal is the recall's CPU-tier *cache-hit outcome*
+    (`classify_needle_outcome`): did the policy keep the needle's blocks in
+    the CPU tier (HIT), evict them so the recall had to recompute (MISS), or
+    was the run not even under capacity pressure (NOT_PRESSURED, a built-in
+    validity check). This is the only signal that can actually distinguish
+    "semantic preserved it" from "lru dropped it" in the lossless
+    architecture -- see `classify_needle_outcome` for the full argument.
 """
 
 import random as _random
 import time
+from collections.abc import Callable
 
 import requests
 
@@ -92,6 +109,50 @@ def make_distractor(seed: int) -> str:
     return f"(log entry #{seed}) Write a detailed, factual paragraph about {subject}."
 
 
+_LONG_CORPUS = (
+    "Stellar nucleosynthesis proceeds through fusion stages inside a star core "
+    "beginning with hydrogen burning and progressing to helium and heavier "
+    "elements once temperature and density cross the required threshold. "
+    "Deep sea hydrothermal vent ecosystems derive productivity from "
+    "chemosynthetic bacteria that oxidize hydrogen sulfide rather than relying "
+    "on photosynthesis supporting dense communities in total darkness. "
+    "Distributed consensus protocols tolerate node failures and network "
+    "partitions while guaranteeing that correct replicas agree on the same "
+    "committed sequence typically by requiring a quorum of acknowledgments. "
+    "Volcanic eruptions are classified by an explosivity index that depends on "
+    "magma viscosity dissolved gas content and the rate of magma ascent. "
+    "Medieval trade networks connected distant regions moving silk spices "
+    "technologies religions and diseases along overlapping caravan routes."
+).split()
+
+
+def make_long_distractor(seed: int, target_words: int = 200) -> str:
+    """A multi-KV-block distractor, unlike the single-block `make_distractor`.
+
+    `needle-v2` needs enough distinct CPU-tier content to force real
+    eviction, but building it from *many short* requests floods the semantic
+    scorer with one query-capture per request, and each of those queries
+    EMA-updates the needle's relevance downward -- diluting the early probe
+    signal the whole test depends on (this is why the proven EARLY-HIT
+    regime, issues log entry #11, used ~10 large distractors, not dozens of
+    tiny ones). A handful of *large* distractors builds the same byte volume
+    with far fewer competing queries.
+
+    Every ~16-token block must differ across seeds or vLLM's content-hash
+    dedup collapses them (entry #57's first-block lesson, here generalized to
+    the whole prompt): a per-seed prefix tag plus a positional `[s{seed}.i]`
+    marker injected every few words guarantees it without a tokenizer."""
+    words = list(_LONG_CORPUS)
+    out = [f"(dossier #{seed})"]
+    i = 0
+    while len(out) < target_words:
+        out.append(words[(i + seed) % len(words)])
+        if i % 5 == 0:
+            out.append(f"[s{seed}.{i}]")
+        i += 1
+    return " ".join(out)
+
+
 def _complete(
     base_url: str, model: str, prompt: str, max_tokens: int, timeout_s: float
 ) -> tuple[str, float]:
@@ -152,6 +213,186 @@ def run_needle_case(
         "expected_code": expected_code,
         "recall_text": recall_text,
         "hit": expected_code in recall_text,
+        "reference_count": reference_count,
+        "num_distractors": num_distractors,
+        "t_needle_s": t_needle,
+        "t_recall_s": t_recall,
+        "probe_latencies_s": probe_latencies,
+        "distractor_latencies_s": distractor_latencies,
+    }
+
+
+_LOAD_KEY = "vllm:kv_offload_load_bytes_total"
+_STORE_KEY = "vllm:kv_offload_store_bytes_total"
+
+NEEDLE_HIT = "hit"
+NEEDLE_MISS = "miss"
+NEEDLE_NOT_PRESSURED = "not_pressured"
+
+
+def classify_needle_outcome(recall_load_bytes: float, recall_store_bytes: float) -> str:
+    """Classify the recall request's CPU-tier interaction into one of three
+    unambiguous outcomes.
+
+    This is the whole point of `needle-v2` (see the module note below and
+    issues log entry #58). In vLLM's *lossless* CPU-offload path, KV cache
+    is pure memoization: at temperature 0 the model's output is a
+    deterministic function of the input tokens, so evicting the needle's
+    blocks never changes the recalled answer -- it only changes whether
+    those blocks are reloaded from the CPU tier (fast) or recomputed from
+    scratch (slow). That is exactly why the old `expected_code in
+    recall_text` check read 1.0 for every policy and every tier size: a
+    correctness proxy cannot see an eviction that vLLM silently repairs.
+
+    The real, interpretable signal is what the recall request had to do to
+    reconstruct the needle's blocks, read off two monotonic Prometheus
+    counters isolated to the recall alone:
+
+      * ``load_bytes > 0``  -> the needle's blocks were served straight from
+        the CPU tier: the policy *preserved* them under pressure  -> HIT.
+      * ``load_bytes == 0`` and ``store_bytes > 0`` -> the blocks were absent
+        from both GPU and CPU tiers, so the recall had to recompute and
+        re-store them: the policy *evicted* them  -> MISS.
+      * ``load_bytes == 0`` and ``store_bytes == 0`` -> the blocks were still
+        resident in the GPU prefix cache, so the CPU tier was never
+        consulted at all: the run is *not under capacity pressure*, the
+        result is uninterpretable, and the config (GPU too large relative to
+        the workload) needs `--num-gpu-blocks-override` tightened. This
+        third outcome is the built-in validity check the old metric lacked:
+        the exact silent-1.0 failure that dogged this workload for a whole
+        session now surfaces as a first-class, visible ``not_pressured``
+        result instead of a misleading "hit".
+
+    Args:
+        recall_load_bytes: `kv_offload_load_bytes_total` delta across the
+            recall request only.
+        recall_store_bytes: `kv_offload_store_bytes_total` delta across the
+            recall request only.
+
+    Returns:
+        One of ``NEEDLE_HIT``, ``NEEDLE_MISS``, ``NEEDLE_NOT_PRESSURED``.
+    """
+    if recall_load_bytes > 0:
+        return NEEDLE_HIT
+    if recall_store_bytes > 0:
+        return NEEDLE_MISS
+    return NEEDLE_NOT_PRESSURED
+
+
+def _drain_store_counter(
+    snapshot_metrics: Callable[[], dict[str, float]],
+    *,
+    settle_s: float,
+    max_polls: int,
+) -> dict[str, float]:
+    """Wait for the store counter to stop moving, then return a clean
+    baseline snapshot.
+
+    Distractor prefills store blocks asynchronously; a snapshot taken the
+    instant the last distractor returns can still catch an in-flight store
+    completion and inflate the recall's own `store_bytes` delta -- which
+    would misread a genuine ``not_pressured`` run as a ``miss``. Polling
+    until the counter is stable across two reads removes that contamination
+    (inter-request store activity is bursty-then-quiet, issues log
+    entry #12), without a magic fixed sleep."""
+    prev = snapshot_metrics()
+    for _ in range(max_polls):
+        time.sleep(settle_s)
+        cur = snapshot_metrics()
+        if cur.get(_STORE_KEY, 0.0) == prev.get(_STORE_KEY, 0.0):
+            return cur
+        prev = cur
+    return prev
+
+
+def run_needle_v2_case(
+    base_url: str,
+    *,
+    reference_count: int,
+    num_distractors: int,
+    model: str,
+    seed: int = 0,
+    request_timeout_s: float = 120.0,
+    snapshot_metrics: Callable[[], dict[str, float]] | None = None,
+    settle_s: float = 1.0,
+    max_settle_polls: int = 5,
+    distractor_words: int = 200,
+) -> dict:
+    """Preservation-aware needle case: same plant/probe/flood/recall
+    sequence as `run_needle_case`, but the correctness signal is the
+    recall's *cache-hit outcome* (`classify_needle_outcome`) rather than
+    the always-true `expected_code in recall_text` string check.
+
+    The `reference_count` probes fire *before* the distractor flood (the
+    EARLY condition issues log entry #11 proved lets scoring beat eviction):
+    at ``reference_count == 0`` nothing references the needle before capacity
+    pressure hits, so every policy evicts it (the structural cold-start tie,
+    entries #10-12); at ``reference_count >= 1`` the probes give *semantic*
+    a content-similarity score for the needle -- while giving *lru* nothing,
+    since the probes share zero token overlap with the needle and so confer
+    no recency -- which is exactly where semantic should preserve (HIT) what
+    lru drops (MISS).
+
+    `snapshot_metrics`, when provided, is called to read the raw Prometheus
+    counter dict; the case isolates a clean before/after snapshot around the
+    recall request alone so the reported deltas reflect only the recall's
+    CPU-tier interaction, not the distractors' store volume. Without it the
+    case still runs and returns latencies, but `needle_outcome` is
+    ``None`` (no metrics access = no preservation signal)."""
+    needle_prompt, expected_code = make_needle(seed)
+
+    def complete(prompt: str, max_tokens: int = 60) -> tuple[str, float]:
+        return _complete(base_url, model, prompt, max_tokens, request_timeout_s)
+
+    _, t_needle = complete(needle_prompt, max_tokens=8)
+
+    probe_latencies = []
+    for i in range(reference_count):
+        _, t = complete(make_probe(seed + i), max_tokens=40)
+        probe_latencies.append(t)
+
+    distractor_latencies = []
+    for i in range(num_distractors):
+        prompt = (
+            make_long_distractor(seed + i, distractor_words)
+            if distractor_words > 0
+            else make_distractor(seed + i)
+        )
+        _, t = complete(prompt, max_tokens=16)
+        distractor_latencies.append(t)
+
+    recall_prompt = (
+        f"{needle_prompt}\n\nQuestion: what is the secret verification "
+        f"code mentioned above? Answer with ONLY the code, nothing else."
+    )
+
+    recall_load_bytes: float | None = None
+    recall_store_bytes: float | None = None
+    needle_outcome: str | None = None
+    if snapshot_metrics is not None:
+        before = _drain_store_counter(
+            snapshot_metrics, settle_s=settle_s, max_polls=max_settle_polls
+        )
+        recall_text, t_recall = complete(recall_prompt, max_tokens=20)
+        after = snapshot_metrics()
+        recall_load_bytes = after.get(_LOAD_KEY, 0.0) - before.get(_LOAD_KEY, 0.0)
+        recall_store_bytes = after.get(_STORE_KEY, 0.0) - before.get(_STORE_KEY, 0.0)
+        needle_outcome = classify_needle_outcome(recall_load_bytes, recall_store_bytes)
+    else:
+        recall_text, t_recall = complete(recall_prompt, max_tokens=20)
+
+    return {
+        "expected_code": expected_code,
+        "recall_text": recall_text,
+        # Kept as a sanity flag only: it is ALWAYS true under lossless
+        # offload (the recall restates the needle verbatim, so the answer is
+        # recomputed correctly whether or not the cache was preserved). A
+        # False here would signal real corruption, not eviction -- it is not
+        # the preservation signal. See classify_needle_outcome's docstring.
+        "answer_correct": expected_code in recall_text,
+        "needle_outcome": needle_outcome,
+        "recall_load_bytes": recall_load_bytes,
+        "recall_store_bytes": recall_store_bytes,
         "reference_count": reference_count,
         "num_distractors": num_distractors,
         "t_needle_s": t_needle,

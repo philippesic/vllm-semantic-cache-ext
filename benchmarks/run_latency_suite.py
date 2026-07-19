@@ -62,6 +62,13 @@ RESULT_FIELDS = [
     "itl_p99_ms",
     "throughput_tok_s",
     "needle_hit_rate",
+    # needle-v2's preservation signal (see needle_workload.classify_needle_
+    # outcome): the recall's isolated CPU-tier interaction, not a string
+    # match. `needle_outcome` in {hit, miss, not_pressured}; the two byte
+    # columns are the recall-only counter deltas it was derived from.
+    "needle_outcome",
+    "recall_load_bytes",
+    "recall_store_bytes",
     "load_bytes_delta",
     "store_bytes_delta",
     "preemptions_delta",
@@ -451,6 +458,76 @@ def main():
                                 # (and every later) policy's run.
                                 print(
                                     f"policy={policy} workload=needle "
+                                    f"ref_count={ref_count} FAILED: {e}",
+                                    flush=True,
+                                )
+                                row = {
+                                    "policy": policy,
+                                    "seed": args.seed,
+                                    "workload": workload,
+                                    "reference_count": ref_count,
+                                    "error": str(e)[:500],
+                                }
+                            writer.writerow(row)
+                            csv_file.flush()
+                    elif workload == "needle-v2":
+                        # Preservation-aware needle: the recall's cache-hit
+                        # outcome (hit/miss/not_pressured), the only signal
+                        # that distinguishes semantic-preserved from
+                        # lru-evicted under lossless offload (issues log
+                        # entry #58). REQUIRES a tightened GPU
+                        # (--num-gpu-blocks-override) and a small
+                        # --cpu-bytes-to-use, else every cell reads
+                        # not_pressured (the built-in validity check).
+                        def _snap():
+                            return metrics_mod.snapshot(handle.metrics_url())
+
+                        for ref_count in ref_counts:
+                            try:
+                                before = _snap()
+                                result = needle_workload.run_needle_v2_case(
+                                    handle.base_url(),
+                                    reference_count=ref_count,
+                                    num_distractors=max(
+                                        1, needle_num_prompts - ref_count
+                                    ),
+                                    model=args.model,
+                                    seed=ref_count,
+                                    snapshot_metrics=_snap,
+                                )
+                                after = _snap()
+                                delta = metrics_mod.diff(before, after)
+                                row = {
+                                    "policy": policy,
+                                    "seed": args.seed,
+                                    "workload": workload,
+                                    "reference_count": ref_count,
+                                    "needle_outcome": result["needle_outcome"],
+                                    "recall_load_bytes": result["recall_load_bytes"],
+                                    "recall_store_bytes": result["recall_store_bytes"],
+                                    "needle_hit_rate": (
+                                        1.0
+                                        if result["needle_outcome"]
+                                        == needle_workload.NEEDLE_HIT
+                                        else 0.0
+                                    ),
+                                    "duration_s": result["t_needle_s"]
+                                    + result["t_recall_s"]
+                                    + sum(result["probe_latencies_s"])
+                                    + sum(result["distractor_latencies_s"]),
+                                    "load_bytes_delta": delta[
+                                        "vllm:kv_offload_load_bytes_total"
+                                    ],
+                                    "store_bytes_delta": delta[
+                                        "vllm:kv_offload_store_bytes_total"
+                                    ],
+                                    "preemptions_delta": delta[
+                                        "vllm:num_preemptions_total"
+                                    ],
+                                }
+                            except Exception as e:
+                                print(
+                                    f"policy={policy} workload=needle-v2 "
                                     f"ref_count={ref_count} FAILED: {e}",
                                     flush=True,
                                 )

@@ -21,9 +21,19 @@ from collections.abc import Iterable
 
 from typing_extensions import override
 
+from semantic_offload._debug import debug_print
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+
+# How often (in touch() calls with session_aware on) to print the
+# SEMANTIC_SESSION_DEBUG growth line -- issues log entry #70's open question
+# (why session_aware causes a much bigger cache-hit-volume jump for minmax
+# than mean/cuboid-mean at real 7B/B200 scale, when dev-box testing at the
+# same config shows ~no effect for any method at all -- the mechanism only
+# seems to manifest at production scale/duration, which this counter is
+# meant to let a real B200 run actually observe).
+_SESSION_DEBUG_EVERY = 200
 
 
 class SemanticPolicy(CachePolicy):
@@ -122,6 +132,7 @@ class SemanticPolicy(CachePolicy):
         self._session_aware = session_aware
         self._last_touch_req_id: dict[OffloadKey, str] = {}
         self._session_proven: set[OffloadKey] = set()
+        self._session_touch_calls = 0
         # Recency-weighted variant (issues log entry #21's follow-up): a flat
         # bonus is provably unable to distinguish an actively-used proven
         # session from an idle-but-proven one once eviction is choosing only
@@ -187,6 +198,15 @@ class SemanticPolicy(CachePolicy):
                 self._touch_seq += 1
                 for k in ordered:
                     self._last_touch_seq[k] = self._touch_seq
+            self._session_touch_calls += 1
+            if self._session_touch_calls % _SESSION_DEBUG_EVERY == 0:
+                debug_print(
+                    f"SEMANTIC_SESSION_DEBUG method={self._method} "
+                    f"touch_calls={self._session_touch_calls} "
+                    f"cross_request_hit={cross_request_hit} "
+                    f"session_proven_size={len(self._session_proven)} "
+                    f"resident_size={len(self._lru.blocks)}"
+                )
 
     @override
     def evict(

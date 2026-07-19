@@ -201,3 +201,31 @@ def test_manager_update_relevance_ema():
 
     assert manager.ranked_keys("mean") == [(key, manager.relevance_ema["mean"][key])]
     assert manager.ranked_keys("minmax") == []  # untouched method stays empty
+
+
+def test_update_relevance_rank_weighting_protects_top_ranked_key():
+    """Regression for issues log entry #60: a needle key that one probe query
+    ranked highest must survive several subsequent distractor queries that
+    rank it last among a larger candidate pool -- a flat per-key alpha (the
+    pre-fix behavior) collapses it to near the distractor floor within a
+    handful of updates; rank-weighting should barely move it."""
+    manager = SemanticOffloadingManager.__new__(SemanticOffloadingManager)
+    manager.relevance_ema = {}
+    needle = to_key(1)
+    distractors = [to_key(i) for i in range(2, 12)]  # 10 other candidates
+
+    # One probe query ranks the needle top of an 11-candidate pool.
+    probe_ranked = [(needle, 1.0)] + [(k, 0.1) for k in distractors]
+    manager.update_relevance({"mean": {"probe": probe_ranked}})
+    assert manager.relevance_ema["mean"][needle] == 1.0
+
+    # Five unrelated distractor queries each rank the needle dead last.
+    for i in range(5):
+        distractor_ranked = [(k, 0.9) for k in distractors] + [(needle, 0.0)]
+        manager.update_relevance({"mean": {f"distractor-{i}": distractor_ranked}})
+
+    needle_score = manager.relevance_ema["mean"][needle]
+    assert needle_score > 0.9, (
+        "needle's EMA collapsed toward the distractor floor -- rank weighting "
+        f"should have barely touched a last-ranked key, got {needle_score}"
+    )

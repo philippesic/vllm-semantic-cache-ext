@@ -13,7 +13,8 @@ from semantic_offload.policy import SemanticPolicy
 from vllm.v1.kv_offload.base import OffloadKey
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
-_EMA_ALPHA = 0.3  # weight on the newest observation; see update_relevance
+_EMA_ALPHA = 0.3  # ceiling weight on the newest observation; see update_relevance
+_EMA_RANK_POWER = 1.0  # unturned, like _DEFAULT_ALPHA below
 # minmax was the strongest per-KV-head scoring method in the real needle
 # test (issues log entry #9: rank 2/580 for the answer-critical block, vs.
 # cuboid_mean's 1/580 and mean's 73/580) -- picking minmax over cuboid_mean
@@ -69,18 +70,41 @@ class SemanticOffloadingManager(CPUOffloadingManager):
     ) -> None:
         """Fold in this step's worker-reported scores via an EMA, so one
         noisy step can't thrash the cache (plan's Step 1.3 requirement).
-        `scores` is method -> req_id -> ranked [(key, score), ...]; req_id
-        isn't needed for the EMA itself (relevance is per-block, not
-        per-requester) so it's flattened away here."""
+        `scores` is method -> req_id -> ranked [(key, score), ...], already
+        sorted highest-score-first per query (worker.py's `_on_query_captured`);
+        req_id isn't needed for the EMA itself (relevance is per-block, not
+        per-requester) so it's flattened away here.
+
+        Every candidate in `ranked` is touched (not just a top-K slice) --
+        an earlier `_TOP_M` cap that scored/updated only the top-8 per query
+        was removed because most resident blocks would then never earn any
+        EMA entry at all, regardless of pool size (issues log entries
+        #29-31). But touching every candidate with the *same* flat alpha
+        turned out to have its own failure mode (entry #60): a topically
+        unrelated distractor query ranks the needle near the bottom of its
+        own candidate list and, at full alpha, actively drags an
+        already-high needle score back down -- a handful of irrelevant
+        queries erase one strong probe's signal well before real capacity
+        pressure ever forces an eviction decision. Fix: scale the per-key
+        weight by that key's *rank within this query's own ranked list*
+        (not an absolute top-K cutoff, so coverage is preserved) -- a
+        candidate this query considers most-relevant gets close to the
+        full ceiling weight, one it considers least-relevant gets a weight
+        near zero, so it keeps its prior score rather than being pulled
+        toward this query's near-irrelevant one."""
         for method, per_req in scores.items():
             ema = self.relevance_ema.setdefault(method, {})
             for ranked in per_req.values():
-                for key, new_score in ranked:
+                n = len(ranked)
+                denom = max(n - 1, 1)
+                for rank, (key, new_score) in enumerate(ranked):
+                    frac = rank / denom  # 0.0 = this query's top pick
+                    weight = _EMA_ALPHA * (1.0 - frac) ** _EMA_RANK_POWER
                     prev = ema.get(key)
                     ema[key] = (
                         new_score
                         if prev is None
-                        else _EMA_ALPHA * new_score + (1 - _EMA_ALPHA) * prev
+                        else weight * new_score + (1 - weight) * prev
                     )
 
     def ranked_keys(self, method: str) -> list[tuple[OffloadKey, float]]:

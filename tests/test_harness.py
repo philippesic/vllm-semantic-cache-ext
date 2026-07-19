@@ -95,6 +95,23 @@ def test_needle_and_probe_and_distractor_share_no_literal_overlap():
     assert code not in distractor
 
 
+def test_distractor_prompts_are_distinct_across_a_real_case_size():
+    """A real needle case calls make_distractor(seed+i) for i in
+    range(num_distractors) (up to 25) -- `subject` is drawn from only 5
+    values, so without a per-call unique tag, most calls collapse onto
+    identical prompt text and vLLM's prefix-cache hashing then treats
+    them as cache hits instead of distinct KV blocks, silently capping
+    how much real content the workload generates regardless of
+    num_distractors (issues log entry #56)."""
+    distractors = [needle_workload.make_distractor(i) for i in range(25)]
+    assert len(set(distractors)) == 25
+
+
+def test_probe_prompts_are_distinct_across_a_real_case_size():
+    probes = [needle_workload.make_probe(i) for i in range(5)]
+    assert len(set(probes)) == 5
+
+
 def test_metrics_parse_sums_across_label_combinations():
     text = """
 # HELP vllm:num_preemptions_total x

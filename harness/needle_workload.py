@@ -52,7 +52,15 @@ def make_needle(seed: int) -> tuple[str, str]:
 def make_probe(seed: int) -> str:
     """Topically-similar to the needle framing (classified-briefing style)
     but with zero token overlap in content -- gives the needle's blocks a
-    chance to earn a relevance score without literally repeating them."""
+    chance to earn a relevance score without literally repeating them.
+
+    The `(briefing reference #{seed})` suffix makes every call's prompt
+    text unique even though `topic` is drawn from a small fixed pool --
+    without it, a real run's `reference_count` calls collapse onto only
+    len(topics) distinct strings, and vLLM's prefix-cache content hashing
+    then treats repeats as cache hits rather than distinct KV blocks,
+    silently capping how much real content the workload ever generates
+    regardless of how many calls are made (see issues log entry #56)."""
     rng = _random.Random(seed + 100000)
     topic = rng.choice(
         ["logistics", "personnel", "supply chain", "communications", "scheduling"]
@@ -60,11 +68,15 @@ def make_probe(seed: int) -> str:
     return (
         f"In this classified briefing about {topic}, please summarize the "
         f"key operational considerations for the next quarter in two "
-        f"sentences."
+        f"sentences. (briefing reference #{seed})"
     )
 
 
 def make_distractor(seed: int) -> str:
+    """See `make_probe`'s docstring -- the `(log entry #{seed})` suffix is
+    required for the same reason: `subject` alone only has 5 distinct
+    values, so `num_distractors` calls would otherwise silently produce
+    far fewer than `num_distractors` distinct KV blocks."""
     rng = _random.Random(seed + 200000)
     subject = rng.choice(
         [
@@ -75,7 +87,7 @@ def make_distractor(seed: int) -> str:
             "the economics of early rail networks",
         ]
     )
-    return f"Write a detailed, factual paragraph about {subject}."
+    return f"Write a detailed, factual paragraph about {subject}. (log entry #{seed})"
 
 
 def _complete(

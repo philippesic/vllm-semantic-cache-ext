@@ -107,6 +107,20 @@ def test_distractor_prompts_are_distinct_across_a_real_case_size():
     assert len(set(distractors)) == 25
 
 
+def test_distractor_prompts_differ_within_the_first_block_of_tokens():
+    """The base sentence tokenizes to under 16 tokens (one KV block), and
+    the CPU-offload connector only ever stores blocks complete AT PREFILL
+    TIME -- a unique tag appended at the END still lands in a later block
+    that two same-`subject` calls share identically, so real content
+    volume stayed capped even after the first fix (entry #56 follow-up,
+    confirmed token-exact against the real tokenizer). Guard against that
+    regression here without needing a real tokenizer: the tag must be a
+    *prefix*, so distinct calls must differ within the first ~16
+    characters, not just somewhere in the full string."""
+    prefixes = {needle_workload.make_distractor(i)[:16] for i in range(25)}
+    assert len(prefixes) == 25
+
+
 def test_probe_prompts_are_distinct_across_a_real_case_size():
     probes = [needle_workload.make_probe(i) for i in range(5)]
     assert len(set(probes)) == 5

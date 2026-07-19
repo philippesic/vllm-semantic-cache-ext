@@ -76,15 +76,18 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
     def __init__(
         self,
         kv_caches: CanonicalKVCaches,
-        block_size_factor: int,
+        blocks_per_chunk: int,
         num_cpu_blocks: int,
         vllm_config: VllmConfig,
         method: str = "minmax",
         capture_stride: int = 1,
     ):
+        # CPUOffloadingWorker's param was renamed block_size_factor ->
+        # blocks_per_chunk upstream (vLLM #48150); matched here for
+        # consistency rather than translating at the call boundary.
         super().__init__(
             kv_caches=kv_caches,
-            block_size_factor=block_size_factor,
+            blocks_per_chunk=blocks_per_chunk,
             num_cpu_blocks=num_cpu_blocks,
         )
         if method not in _SCORING_METHODS:
@@ -138,16 +141,20 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         self.durable_summaries: dict[OffloadKey, list[BlockSummary]] = {}
         self._pending_job_keys: dict[int, list[OffloadKey]] = {}
         self._pending_scores: dict[str, dict[str, list[tuple[OffloadKey, float]]]] = {}
-        # Cache of durable_summaries stacked into batched tensors, rebuilt
-        # only when new entries are added (_durably_key_summaries sets the
-        # dirty flag) instead of on every query capture -- query captures
-        # fire on nearly every prefill/mixed step, while insertions happen
-        # far less often, so rebuilding fresh each time was itself a real
-        # Python-level O(n_candidates) cost even after the scoring math
-        # itself was vectorized (issues log entry #53's follow-up).
+        # Cache of durable_summaries stacked into batched tensors, kept in
+        # sync incrementally (see _rebuild_stack_cache) rather than rebuilt
+        # from scratch on every query capture -- query captures fire on
+        # nearly every prefill/mixed step, while any single step only ever
+        # inserts/evicts a handful of candidates, so a from-scratch rebuild
+        # over the WHOLE resident pool on every dirty step was the dominant
+        # cost in the entire hot path at real production scale (issues log
+        # entries #53's follow-up, #72, #74).
         self._stack_cache_dirty = True
         self._stack_cache_keys: list[OffloadKey] = []
         self._stack_cache: dict[str, torch.Tensor] = {}
+        self._stack_cache_index: dict[OffloadKey, int] = {}
+        self._stack_pending_insert: set[OffloadKey] = set()
+        self._stack_pending_remove: set[OffloadKey] = set()
         self._query_capture_mode = None
         if self._probe_layer_name is not None:
             probe_layer = self._attention_layers[self._probe_layer_name]
@@ -186,11 +193,32 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
             k for k in evicted_keys if self.durable_summaries.pop(k, None) is not None
         ]
         if removed:
-            self._stack_cache_dirty = True
+            self._mark_removed_from_stack_cache(removed)
         debug_print(
             f"SEMANTIC_EVICT_DEBUG received={len(evicted_keys)} "
             f"removed={len(removed)} resident={len(self.durable_summaries)}"
         )
+
+    def _mark_inserted_into_stack_cache(self, keys) -> None:
+        """Record keys as needing a row in the stacked-tensor cache. A key
+        that already has a synced row (an overwrite -- same OffloadKey
+        re-stored with new content) is also queued for removal of its stale
+        row, so the sync ends up with exactly one, up-to-date row per key."""
+        for key in keys:
+            if key in self._stack_cache_index:
+                self._stack_pending_remove.add(key)
+            self._stack_pending_insert.add(key)
+        self._stack_cache_dirty = True
+
+    def _mark_removed_from_stack_cache(self, keys) -> None:
+        """Record keys as needing to be dropped from the stacked-tensor
+        cache. A key never yet synced in (still only pending-insert) is
+        simply un-queued -- no row was ever created for it."""
+        for key in keys:
+            self._stack_pending_insert.discard(key)
+            if key in self._stack_cache_index:
+                self._stack_pending_remove.add(key)
+        self._stack_cache_dirty = True
 
     def pop_pending_scores(
         self,
@@ -200,23 +228,59 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         return scores
 
     def _rebuild_stack_cache(self) -> None:
-        """Stack every resident candidate's summaries (only the fields
-        `self._method` actually needs) into batched tensors once, cached
-        until the next insertion. See the dirty-flag comment in __init__
-        for why this is cached rather than rebuilt on every query capture."""
-        keys = list(self.durable_summaries.keys())
-        summary_lists = list(self.durable_summaries.values())
-        cache: dict[str, torch.Tensor] = {}
-        for field in _METHOD_FIELDS[self._method]:
-            # [n_candidates, num_kv_heads, head_dim]
-            cache[field] = torch.stack(
-                [
-                    torch.stack([getattr(s, field) for s in summary_list])
-                    for summary_list in summary_lists
-                ]
-            )
-        self._stack_cache_keys = keys
-        self._stack_cache = cache
+        """Bring the stacked-tensor cache back in sync with
+        durable_summaries incrementally: compact out pending removals with
+        one vectorized boolean-mask op per field, then stack and append only
+        the newly-inserted candidates -- instead of a from-scratch Python
+        getattr+torch.stack rebuild over EVERY resident candidate on every
+        dirty query capture. See the dirty-flag comment in __init__: on
+        `chat`-style traffic the cache is dirtied on nearly every step while
+        only a handful of candidates actually change per step, so the old
+        full rebuild was by far the dominant cost in the whole hot path
+        (40-100x every other bucket -- issues log entries #72/#74)."""
+        fields = _METHOD_FIELDS[self._method]
+
+        if self._stack_pending_remove:
+            keep_mask = torch.ones(len(self._stack_cache_keys), dtype=torch.bool)
+            for key in self._stack_pending_remove:
+                idx = self._stack_cache_index.pop(key, None)
+                if idx is not None:
+                    keep_mask[idx] = False
+            surviving_keys = [
+                k for k, keep in zip(self._stack_cache_keys, keep_mask.tolist()) if keep
+            ]
+            for field in fields:
+                self._stack_cache[field] = self._stack_cache[field][keep_mask]
+            self._stack_cache_keys = surviving_keys
+            self._stack_cache_index = {k: i for i, k in enumerate(surviving_keys)}
+            self._stack_pending_remove.clear()
+
+        if self._stack_pending_insert:
+            new_keys = [
+                k for k in self._stack_pending_insert if k in self.durable_summaries
+            ]
+            self._stack_pending_insert.clear()
+            if new_keys:
+                new_summary_lists = [self.durable_summaries[k] for k in new_keys]
+                for field in fields:
+                    # [n_new, num_kv_heads, head_dim]
+                    new_stack = torch.stack(
+                        [
+                            torch.stack([getattr(s, field) for s in summary_list])
+                            for summary_list in new_summary_lists
+                        ]
+                    )
+                    existing = self._stack_cache.get(field)
+                    self._stack_cache[field] = (
+                        torch.cat([existing, new_stack], dim=0)
+                        if existing is not None and existing.numel()
+                        else new_stack
+                    )
+                base = len(self._stack_cache_keys)
+                for offset, key in enumerate(new_keys):
+                    self._stack_cache_index[key] = base + offset
+                self._stack_cache_keys.extend(new_keys)
+
         self._stack_cache_dirty = False
 
     def _on_query_captured(self, req_id: str, query_repr: torch.Tensor) -> None:
@@ -401,21 +465,29 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
             # proxy for all of its keys rather than dropping the signal.
             for key in keys:
                 self.durable_summaries[key] = block_summaries[-1]
-        self._prune_durable_summaries()
-        self._stack_cache_dirty = True
+        self._mark_inserted_into_stack_cache(keys)
+        pruned = self._prune_durable_summaries()
+        if pruned:
+            self._mark_removed_from_stack_cache(pruned)
 
-    def _prune_durable_summaries(self) -> None:
+    def _prune_durable_summaries(self) -> list[OffloadKey]:
         """Bound `durable_summaries` to (approximately) the real CPU tier's
         capacity -- see the `_max_durable_summaries` comment in __init__ for
         why this exists and its known imprecision. Evicts oldest-inserted
         first: plain dicts preserve insertion order, so this needs no extra
         bookkeeping, and insertion order is a reasonable proxy for "still
-        resident" absent a real eviction signal."""
+        resident" absent a real eviction signal. Returns the pruned keys so
+        the caller can also drop their (possibly already-synced) rows from
+        the stack cache -- this path bypasses receive_evicted_keys, so
+        without this a pruned key's stale row would otherwise linger in the
+        cache and keep being scored forever."""
         overflow = len(self.durable_summaries) - self._max_durable_summaries
         if overflow <= 0:
-            return
-        for key in list(itertools.islice(self.durable_summaries, overflow)):
+            return []
+        pruned = list(itertools.islice(self.durable_summaries, overflow))
+        for key in pruned:
             del self.durable_summaries[key]
+        return pruned
 
     def submit_store(
         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec

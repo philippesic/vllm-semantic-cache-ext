@@ -527,6 +527,60 @@ def test_grid_sweep_cell_args_use_num_prompts_when_no_duration_given():
     assert "--num-gpu-blocks-override" not in args
 
 
+def test_grid_sweep_cell_args_forward_extra_config_when_given():
+    """Regression: run_grid_sweep.py's --extra-config (used to enable
+    SemanticPolicy tuning knobs like session_aware across a real multi-seed
+    grid pass, issues log entry #68) must actually reach each cell's
+    run_latency_suite.py invocation, not just the single-cell script."""
+    from benchmarks.run_grid_sweep import build_run_latency_suite_args
+
+    args = build_run_latency_suite_args(
+        model="m",
+        policy="semantic-minmax",
+        workloads="rag",
+        request_rates="0.15",
+        needle_reference_counts="0,1,2",
+        target_duration_s=600.0,
+        num_prompts=None,
+        scale=1.0,
+        cpu_bytes_to_use=1000,
+        gpu_memory_utilization=0.5,
+        max_model_len=2048,
+        num_gpu_blocks_override=None,
+        port=8199,
+        seed=1,
+        output_dir="/tmp/out",
+        extra_config='{"session_aware": true}',
+    )
+    assert (
+        "--extra-config" in args
+        and args[args.index("--extra-config") + 1] == '{"session_aware": true}'
+    )
+
+
+def test_grid_sweep_cell_args_omit_extra_config_by_default():
+    from benchmarks.run_grid_sweep import build_run_latency_suite_args
+
+    args = build_run_latency_suite_args(
+        model="m",
+        policy="lru",
+        workloads="chat",
+        request_rates="2.0",
+        needle_reference_counts="0",
+        target_duration_s=None,
+        num_prompts=20,
+        scale=1.0,
+        cpu_bytes_to_use=1000,
+        gpu_memory_utilization=0.5,
+        max_model_len=2048,
+        num_gpu_blocks_override=None,
+        port=8199,
+        seed=1,
+        output_dir="/tmp/out",
+    )
+    assert "--extra-config" not in args
+
+
 def test_build_slots_assigns_unique_port_and_output_dir_per_gpu():
     from benchmarks.run_grid_sweep import build_slots
 

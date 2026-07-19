@@ -105,6 +105,7 @@ def build_run_latency_suite_args(
     port: int,
     seed: int,
     output_dir: str,
+    extra_config: str | None = None,
 ) -> list[str]:
     """Pure, unit-testable: the argv for one (policy, seed) cell. Kept
     separate from the actual subprocess-launching loop below."""
@@ -140,6 +141,8 @@ def build_run_latency_suite_args(
         args += ["--target-duration-s", str(target_duration_s)]
     else:
         args += ["--num-prompts", str(num_prompts)]
+    if extra_config is not None:
+        args += ["--extra-config", extra_config]
     return args
 
 
@@ -203,6 +206,15 @@ def main():
     parser.add_argument("--num-gpu-blocks-override", type=int, default=None)
     parser.add_argument("--port", type=int, default=8199)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--extra-config",
+        default=None,
+        help=(
+            "JSON dict forwarded to each cell's run_latency_suite.py "
+            "--extra-config (SemanticPolicy tuning knobs; ignored for "
+            "lru/arc)."
+        ),
+    )
     parser.add_argument(
         "--gpus",
         default="0",
@@ -276,6 +288,7 @@ def main():
                 port=slot["port"],
                 seed=seed,
                 output_dir=slot["output_dir"],
+                extra_config=parsed.extra_config,
             )
             env = {**os.environ, "CUDA_VISIBLE_DEVICES": slot["gpu_id"]}
             proc = subprocess.Popen(

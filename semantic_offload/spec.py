@@ -21,12 +21,20 @@ class SemanticOffloadingSpec(CPUOffloadingSpec):
         # (SemanticPolicy only consults its own method's relevance EMA) --
         # same extra_config key get_manager() already reads below.
         method = str(self.extra_config.get("method", "minmax"))
+        # Only every capture_stride-th eligible query-capture step actually
+        # scores/updates relevance (default 1: unchanged, every step) -- a
+        # TTFT-tax follow-up knob, see query_capture.py's
+        # `_should_sample_step` and semantic-eviction-plan.md's post-fix
+        # optimization pass. Relies on the manager's EMA staleness-tolerance
+        # to carry signal across skipped steps.
+        capture_stride = int(self.extra_config.get("capture_stride", 1))
         return SemanticOffloadingWorker(
             kv_caches=kv_caches,
             block_size_factor=self.block_size_factor,
             num_cpu_blocks=self.num_blocks,
             vllm_config=self.vllm_config,
             method=method,
+            capture_stride=capture_stride,
         )
 
     @override

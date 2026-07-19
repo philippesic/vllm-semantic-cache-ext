@@ -80,6 +80,7 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         num_cpu_blocks: int,
         vllm_config: VllmConfig,
         method: str = "minmax",
+        capture_stride: int = 1,
     ):
         super().__init__(
             kv_caches=kv_caches,
@@ -159,6 +160,7 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
                 self._probe_layer_name,
                 self._on_query_captured,
                 num_queries_per_kv=num_queries_per_kv,
+                capture_stride=capture_stride,
             )
 
     def receive_job_keys(self, store_job_keys: dict[int, list[OffloadKey]]) -> None:

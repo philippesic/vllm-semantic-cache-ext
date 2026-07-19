@@ -67,11 +67,28 @@ def _patch_prepare_inputs(state: dict) -> None:
     GPUModelRunner._semantic_prepare_inputs_patched = True
 
 
+def _should_sample_step(step_index: int, stride: int) -> bool:
+    """True on every `stride`-th eligible query-capture step (stride<=1:
+    every step, the historical default). Counted once per real query-
+    capture-eligible dispatch event (one per step), not per request within
+    it, so concurrent requests sharing a step are throttled together as a
+    unit rather than independently -- a coarser cadence relies on the
+    manager's own EMA staleness-tolerance (Step 1.4) to carry relevance
+    signal forward across skipped steps, not on every step being scored.
+    See semantic-eviction-plan.md's TTFT-tax follow-up investigation for
+    why this knob exists (leads #1/#3): stack_rebuild/update_relevance's
+    per-call cost is bounded but non-trivial (issues log entries #62-65),
+    and their aggregate cost scales with how often query-capture fires, not
+    just candidate-pool size."""
+    return stride <= 1 or step_index % stride == 0
+
+
 def install(
     vllm_config: VllmConfig,
     probe_layer_name: str,
     on_query: Callable[[str, torch.Tensor], None],
     num_queries_per_kv: int = 1,
+    capture_stride: int = 1,
 ) -> TorchDispatchMode:
     """Install both patches. `on_query(req_id, query_repr)` fires once per
     request per step whenever live query data is captured for the probe
@@ -84,13 +101,17 @@ def install(
     heads. See issues log entry #8 for why last-token (vs. whole-step mean)
     was adopted, and entry #9 for why per-KV-head (vs. fully-pooled) was
     adopted on top of that. Returns the installed dispatch mode; caller must
-    keep a reference alive for the duration of the process."""
+    keep a reference alive for the duration of the process.
+
+    `capture_stride`: only every `capture_stride`-th eligible step actually
+    fires `on_query` (default 1: unchanged, every step) -- see
+    `_should_sample_step`."""
     assert vllm_config.use_v2_model_runner, (
         "query capture targets the V2 GPUModelRunner only -- a model/config "
         "defaulting to the legacy runner needs a different patch point, see "
         "semantic-eviction-issues-log.md entry #6"
     )
-    state: dict = {"layout": None}
+    state: dict = {"layout": None, "step_index": 0}
     _patch_prepare_inputs(state)
 
     class ProbeMode(TorchDispatchMode):
@@ -119,6 +140,14 @@ def install(
                     and resolved_name == probe_layer_name
                     and query.shape[0] >= layout.num_tokens
                 ):
+                    # Counted once per eligible step (not per request in it)
+                    # so a throttled cadence applies uniformly to whichever
+                    # requests happen to share this step -- see
+                    # `_should_sample_step`.
+                    step_index = state["step_index"]
+                    state["step_index"] = step_index + 1
+                    if not _should_sample_step(step_index, capture_stride):
+                        return func(*args, **kwargs)
                     # CUDA-graph replay pads short batches up to a fixed
                     # capture size; real tokens always occupy the prefix
                     # [0, num_tokens) and padding is appended after (verified

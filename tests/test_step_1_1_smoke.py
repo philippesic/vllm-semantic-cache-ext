@@ -24,6 +24,9 @@ from semantic_offload.index import BlockSummary, build_summary, score
 from semantic_offload.manager import SemanticOffloadingManager
 from semantic_offload.spec import SemanticOffloadingSpec
 
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+    build_offloading_config,
+)
 from vllm.v1.kv_offload.base import OffloadingSpec, ReqContext, make_offload_key
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
@@ -120,9 +123,15 @@ def _make_kv_cache_config():
 def test_spec_loads_via_spec_module_path():
     """SemanticOffloadingSpec is not pre-registered; it must resolve via the
     same spec_module_path dynamic-import path documented for external
-    packages in vllm/v1/kv_offload/factory.py."""
+    packages in vllm/v1/kv_offload/factory.py.
+
+    get_spec_cls() takes the raw kv_connector_extra_config mapping directly
+    (not the whole VllmConfig) as of vLLM #48150 ("Define clean backend
+    configuration boundary") -- mirrors the real call site's own signature,
+    same as create_spec below."""
     config = _make_vllm_config()
-    spec_cls = OffloadingSpecFactory.get_spec_cls(config)
+    extra_config = config.kv_transfer_config.kv_connector_extra_config
+    spec_cls = OffloadingSpecFactory.get_spec_cls(extra_config)
     assert spec_cls is SemanticOffloadingSpec
     assert issubclass(spec_cls, OffloadingSpec)
 
@@ -133,7 +142,8 @@ def test_spec_constructs_end_to_end_and_serves_manager():
     at the manager-construction granularity."""
     config = _make_vllm_config()
     kv_cache_config = _make_kv_cache_config()
-    spec = OffloadingSpecFactory.create_spec(config, kv_cache_config)
+    offloading_config = build_offloading_config(config, kv_cache_config)
+    spec = OffloadingSpecFactory.create_spec(offloading_config)
     assert isinstance(spec, SemanticOffloadingSpec)
     assert spec.num_blocks > 0
 
@@ -150,7 +160,8 @@ def test_spec_extra_config_method_selects_real_scoring_method():
     what Step 1.6's benchmark grid actually launches servers with."""
     config = _make_vllm_config(extra_config_overrides={"method": "cuboid_mean"})
     kv_cache_config = _make_kv_cache_config()
-    spec = OffloadingSpecFactory.create_spec(config, kv_cache_config)
+    offloading_config = build_offloading_config(config, kv_cache_config)
+    spec = OffloadingSpecFactory.create_spec(offloading_config)
 
     manager = spec.get_manager()
 

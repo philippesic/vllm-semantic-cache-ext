@@ -30,7 +30,9 @@ class SemanticOffloadingSpec(CPUOffloadingSpec):
         capture_stride = int(self.extra_config.get("capture_stride", 1))
         return SemanticOffloadingWorker(
             kv_caches=kv_caches,
-            block_size_factor=self.block_size_factor,
+            # OffloadingSpec's own attribute was renamed block_size_factor ->
+            # blocks_per_chunk upstream (vLLM #48150).
+            blocks_per_chunk=self.blocks_per_chunk,
             num_cpu_blocks=self.num_blocks,
             vllm_config=self.vllm_config,
             method=method,

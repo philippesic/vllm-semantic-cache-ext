@@ -45,6 +45,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingWorkerMetadata,
     TransferJob,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+    build_offloading_config,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
     TransferJobStatus,
@@ -150,8 +153,13 @@ class SemanticWorkerMetadata(OffloadingWorkerMetadata):
 
 
 class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
-    def __init__(self, spec):
-        super().__init__(spec)
+    def __init__(self, spec, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
+        # OffloadingConnectorScheduler.__init__ gained vllm_config/
+        # kv_cache_config params upstream (vLLM #48150) to build its
+        # self.config via SchedulerOffloadConfig.from_spec(spec, vllm_config,
+        # kv_cache_config) instead of deriving it from spec alone -- pass
+        # both straight through, mirroring the real base call site.
+        super().__init__(spec, vllm_config, kv_cache_config)
         self._pending_job_keys: dict[int, list[OffloadKey]] = {}
         # Step 1.5 (semantic prefetch) needs a live reference to the
         # scheduler's GPU BlockPool to reserve a small budget of blocks
@@ -722,13 +730,23 @@ class SemanticOffloadingConnector(OffloadingConnector):
         # throwing away) a whole extra SemanticOffloadingManager -- wasteful,
         # and avoidable by just not calling the redundant base constructor.
         KVConnectorBase_V1.__init__(self, vllm_config, role, kv_cache_config)
-        spec = OffloadingSpecFactory.create_spec(vllm_config, kv_cache_config)
+        # create_spec's signature changed upstream (vLLM #48150, "Define
+        # clean backend configuration boundary") from (vllm_config,
+        # kv_cache_config) to a single translated OffloadingConfig -- mirror
+        # OffloadingConnector.__init__'s own real call site exactly
+        # (offloading_connector.py) rather than re-deriving the translation.
+        offloading_config = build_offloading_config(vllm_config, kv_cache_config)
+        spec = OffloadingSpecFactory.create_spec(offloading_config)
         self.connector_scheduler: OffloadingConnectorScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = SemanticOffloadingConnectorScheduler(spec)
+            self.connector_scheduler = SemanticOffloadingConnectorScheduler(
+                spec, vllm_config, kv_cache_config
+            )
         elif role == KVConnectorRole.WORKER:
-            self.connector_worker = SemanticOffloadingConnectorWorker(spec)
+            self.connector_worker = SemanticOffloadingConnectorWorker(
+                spec, kv_cache_config
+            )
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         if isinstance(self.connector_scheduler, SemanticOffloadingConnectorScheduler):

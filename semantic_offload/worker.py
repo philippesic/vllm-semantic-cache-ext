@@ -38,9 +38,12 @@ backend that doesn't match it, rather than silently producing wrong
 summaries. Does not apply to MLA (no per-head keys exist there at all).
 """
 
+import time
+
 import torch
 
-from semantic_offload._debug import debug_print
+from semantic_offload._debug import TIMING as _TIMING
+from semantic_offload._debug import debug_print, record_timing
 from semantic_offload.index import (
     BlockSummary,
     build_summary,
@@ -180,6 +183,7 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
     def _on_query_captured(self, req_id: str, query_repr: torch.Tensor) -> None:
         if not self.durable_summaries:
             return
+        _t_call = time.perf_counter() if _TIMING else 0.0
         # query_repr: [num_kv_heads, head_dim]. summaries are fp32 (Step 1.2
         # upcast).
         query_repr = query_repr.float()
@@ -210,7 +214,10 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         # was building summaries for every model layer, not just this one)
         # fixed in _build_summaries_body below.
         if self._stack_cache_dirty:
+            _t_rebuild = time.perf_counter() if _TIMING else 0.0
             self._rebuild_stack_cache()
+            if _TIMING:
+                record_timing("stack_rebuild", time.perf_counter() - _t_rebuild)
         keys = self._stack_cache_keys
         cache = self._stack_cache
 
@@ -226,9 +233,17 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         # aligned with this query should drive the block's relevance
         # (entry #9). One sync for the whole batch (.tolist()), not one
         # per candidate.
+        _t_sync = time.perf_counter() if _TIMING else 0.0
         scores = per_head.max(dim=-1).values.tolist()
+        if _TIMING:
+            # This .tolist() is a GPU->CPU sync executed on the model compute
+            # stream, once per in-flight request per prefill step -- the
+            # suspected concurrency-scaling stall (issues log open item #1).
+            record_timing("query_captured_sync", time.perf_counter() - _t_sync)
         ranked = sorted(zip(keys, scores), key=lambda kv: kv[1], reverse=True)
         self._pending_scores.setdefault(self._method, {})[req_id] = ranked
+        if _TIMING:
+            record_timing("query_captured_total", time.perf_counter() - _t_call)
         debug_print(
             f"SEMANTIC_STEP1_3_DEBUG req={req_id} method={self._method} "
             f"n_summaries={len(self.durable_summaries)} "

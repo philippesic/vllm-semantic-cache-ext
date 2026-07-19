@@ -25,9 +25,12 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import time
+
 from semantic_offload._debug import DISABLE_PREFETCH as _DISABLE_PREFETCH
 from semantic_offload._debug import ENABLED as _DEBUG_ENABLED
-from semantic_offload._debug import debug_print
+from semantic_offload._debug import TIMING as _TIMING
+from semantic_offload._debug import debug_print, record_timing
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
@@ -776,4 +779,10 @@ class SemanticOffloadingConnector(OffloadingConnector):
         if scores and self.connector_scheduler is not None:
             manager = self.connector_scheduler.manager
             if hasattr(manager, "update_relevance"):
+                # Scheduler-side EMA fold, O(concurrent_reqs x pool_size) per
+                # step -- timed here rather than in manager.py to stay out of
+                # the parallel EMA-pollution edit (issues log open item #1).
+                _t_ur = time.perf_counter() if _TIMING else 0.0
                 manager.update_relevance(scores)
+                if _TIMING:
+                    record_timing("update_relevance", time.perf_counter() - _t_ur)

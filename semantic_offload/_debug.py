@@ -17,6 +17,43 @@ ENABLED = os.environ.get("SEMANTIC_OFFLOAD_DEBUG", "") not in (
     "False",
 )
 
+# Scoped timing instrumentation for the sustained-concurrent-load TTFT
+# investigation (issues log open item #1). Unlike SEMANTIC_OFFLOAD_DEBUG (which
+# prints one line per event -- far too noisy to leave on under real load), this
+# accumulates per-bucket wall time and call counts and emits a compact summary
+# line every SEMANTIC_OFFLOAD_TIMING_EVERY calls of each bucket. Worker and
+# scheduler run in separate processes, so each keeps its own independent
+# accumulators -- a bucket only ever sees calls from one process. Default off;
+# set SEMANTIC_OFFLOAD_TIMING=1 to enable. Remove once the investigation closes.
+TIMING = os.environ.get("SEMANTIC_OFFLOAD_TIMING", "") not in (
+    "",
+    "0",
+    "false",
+    "False",
+)
+_TIMING_EVERY = int(os.environ.get("SEMANTIC_OFFLOAD_TIMING_EVERY", "2000") or 2000)
+# bucket -> [total_seconds, call_count]
+_timing_state: dict[str, list] = {}
+
+
+def record_timing(bucket: str, dt: float) -> None:
+    """Accumulate `dt` seconds under `bucket`; print a cumulative summary
+    (total time, call count, mean ms/call) every `_TIMING_EVERY` calls of
+    that bucket. No-op unless SEMANTIC_OFFLOAD_TIMING is set."""
+    if not TIMING:
+        return
+    slot = _timing_state.setdefault(bucket, [0.0, 0])
+    slot[0] += dt
+    slot[1] += 1
+    if slot[1] % _TIMING_EVERY == 0:
+        total, count = slot[0], slot[1]
+        print(
+            f"SEMANTIC_TIMING bucket={bucket} pid={os.getpid()} calls={count} "
+            f"total_s={total:.3f} mean_ms={1000.0 * total / count:.4f}",
+            flush=True,
+        )
+
+
 # TEMPORARY diagnostic toggle (issues log entry #53's follow-up): a real
 # B200 run showed semantic-minmax causing MORE GPU preemptions than lru
 # under an identical, tight-capacity config (17 vs 5), and each preempted

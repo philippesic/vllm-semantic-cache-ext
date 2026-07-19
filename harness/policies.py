@@ -19,7 +19,9 @@ POLICY_NAMES = (
 )
 
 
-def kv_transfer_config(policy: str, cpu_bytes_to_use: int) -> dict:
+def kv_transfer_config(
+    policy: str, cpu_bytes_to_use: int, extra_config: dict | None = None
+) -> dict:
     if policy not in POLICY_NAMES:
         raise ValueError(f"unknown policy {policy!r}, expected one of {POLICY_NAMES}")
 
@@ -34,14 +36,22 @@ def kv_transfer_config(policy: str, cpu_bytes_to_use: int) -> dict:
         }
 
     method = policy.removeprefix("semantic-").replace("-", "_")
+    semantic_extra = {
+        "spec_name": "SemanticOffloadingSpec",
+        "spec_module_path": "semantic_offload.spec",
+        "cpu_bytes_to_use": cpu_bytes_to_use,
+        "method": method,
+    }
+    # Optional SemanticPolicy tuning knobs (chain_aware, session_aware,
+    # session_bonus_half_life, grace_window_blocks, eviction_mode). Ignored
+    # for stock lru/arc; method/spec_name/cpu_bytes stay authoritative.
+    if extra_config:
+        for key, value in extra_config.items():
+            if key not in semantic_extra:
+                semantic_extra[key] = value
     return {
         "kv_connector": "SemanticOffloadingConnector",
         "kv_connector_module_path": "semantic_offload.connector",
         "kv_role": "kv_both",
-        "kv_connector_extra_config": {
-            "spec_name": "SemanticOffloadingSpec",
-            "spec_module_path": "semantic_offload.spec",
-            "cpu_bytes_to_use": cpu_bytes_to_use,
-            "method": method,
-        },
+        "kv_connector_extra_config": semantic_extra,
     }

@@ -45,6 +45,39 @@ def test_kv_transfer_config_semantic_selects_real_method_name():
         assert config["kv_connector_extra_config"]["method"] == expected_method
 
 
+def test_kv_transfer_config_semantic_merges_extra_config_knobs():
+    config = policies.kv_transfer_config(
+        "semantic-minmax",
+        cpu_bytes_to_use=1000,
+        extra_config={"session_aware": True, "session_bonus_half_life": 8},
+    )
+    extra = config["kv_connector_extra_config"]
+    assert extra["session_aware"] is True
+    assert extra["session_bonus_half_life"] == 8
+    # Method/spec/cpu_bytes stay authoritative and are not overridable.
+    assert extra["method"] == "minmax"
+    assert extra["cpu_bytes_to_use"] == 1000
+
+
+def test_kv_transfer_config_extra_config_ignored_for_stock_policies():
+    for policy in ("lru", "arc"):
+        config = policies.kv_transfer_config(
+            policy, cpu_bytes_to_use=1000, extra_config={"session_aware": True}
+        )
+        assert "session_aware" not in config["kv_connector_extra_config"]
+
+
+def test_kv_transfer_config_extra_config_cannot_override_method():
+    config = policies.kv_transfer_config(
+        "semantic-mean",
+        cpu_bytes_to_use=1000,
+        extra_config={"method": "minmax", "cpu_bytes_to_use": 42},
+    )
+    extra = config["kv_connector_extra_config"]
+    assert extra["method"] == "mean"
+    assert extra["cpu_bytes_to_use"] == 1000
+
+
 def test_kv_transfer_config_rejects_unknown_policy():
     with pytest.raises(ValueError):
         policies.kv_transfer_config("not-a-real-policy", cpu_bytes_to_use=1000)

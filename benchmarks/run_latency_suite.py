@@ -382,7 +382,19 @@ def main():
     parser.add_argument("--num-gpu-blocks-override", type=int, default=None)
     parser.add_argument("--port", type=int, default=8199)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--extra-config",
+        default=None,
+        help=(
+            "JSON dict merged into each semantic policy's "
+            "kv_connector_extra_config (ignored for lru/arc). Use to enable "
+            "SemanticPolicy tuning knobs, e.g. "
+            '\'{"session_aware": true, "session_bonus_half_life": 8}\'.'
+        ),
+    )
     args = parser.parse_args()
+
+    extra_config = json.loads(args.extra_config) if args.extra_config else None
 
     if args.num_prompts is None and args.target_duration_s is None:
         parser.error("one of --num-prompts or --target-duration-s is required")
@@ -406,7 +418,9 @@ def main():
             writer.writeheader()
 
         for policy in policies:
-            kv_config = policies_mod.kv_transfer_config(policy, args.cpu_bytes_to_use)
+            kv_config = policies_mod.kv_transfer_config(
+                policy, args.cpu_bytes_to_use, extra_config=extra_config
+            )
             print(f"=== policy={policy} : launching server ===", flush=True)
             try:
                 handle = launch_server(

@@ -36,6 +36,16 @@ class SemanticOffloadingSpec(CPUOffloadingSpec):
             max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
             grace_window_blocks = int(self.extra_config.get("grace_window_blocks", 0))
             eviction_mode = str(self.extra_config.get("eviction_mode", "blend"))
+            # Structural reuse bonuses (SemanticPolicy's chain/session logic).
+            # Read here so the benchmark grid can actually exercise them --
+            # previously they defaulted off with no launch-time knob, so every
+            # Step 1.6 cell ran with both fully disabled (issues log entry #66
+            # follow-up).
+            chain_aware = bool(self.extra_config.get("chain_aware", False))
+            session_aware = bool(self.extra_config.get("session_aware", False))
+            session_bonus_half_life = int(
+                self.extra_config.get("session_bonus_half_life", 0)
+            )
             # Step 1.6's benchmark grid needs {minmax, mean, cuboid_mean} as
             # separate, selectable configs -- previously hardcoded to
             # manager.py's _DEFAULT_METHOD with no way to pick another at
@@ -48,6 +58,9 @@ class SemanticOffloadingSpec(CPUOffloadingSpec):
                 max_tracker_size=max_tracker_size,
                 grace_window_blocks=grace_window_blocks,
                 eviction_mode=eviction_mode,
+                chain_aware=chain_aware,
+                session_aware=session_aware,
+                session_bonus_half_life=session_bonus_half_life,
                 method=method,
             )
         return self._manager

@@ -31,6 +31,11 @@ from semantic_offload._debug import DISABLE_PREFETCH as _DISABLE_PREFETCH
 from semantic_offload._debug import ENABLED as _DEBUG_ENABLED
 from semantic_offload._debug import TIMING as _TIMING
 from semantic_offload._debug import debug_print, record_timing
+from semantic_offload._vllm_compat import (
+    construct_scheduler_base,
+    construct_worker,
+    create_offloading_spec,
+)
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
@@ -44,9 +49,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
     TransferJob,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
-    build_offloading_config,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
@@ -67,7 +69,6 @@ from vllm.v1.kv_offload.base import (
     OffloadKey,
     OffloadPolicy,
 )
-from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
@@ -155,11 +156,14 @@ class SemanticWorkerMetadata(OffloadingWorkerMetadata):
 class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
     def __init__(self, spec, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
         # OffloadingConnectorScheduler.__init__ gained vllm_config/
-        # kv_cache_config params upstream (vLLM #48150) to build its
-        # self.config via SchedulerOffloadConfig.from_spec(spec, vllm_config,
-        # kv_cache_config) instead of deriving it from spec alone -- pass
-        # both straight through, mirroring the real base call site.
-        super().__init__(spec, vllm_config, kv_cache_config)
+        # kv_cache_config params on some vLLM versions (#48150) to build
+        # its self.config via SchedulerOffloadConfig.from_spec(...) instead
+        # of deriving it from spec alone -- not present on every checkout
+        # this project runs against (confirmed: a rented B200 box's vLLM
+        # predates this refactor entirely), so construct via the real
+        # base __init__'s own actual signature rather than assuming either
+        # shape. See _vllm_compat.py.
+        construct_scheduler_base(self, spec, vllm_config, kv_cache_config)
         self._pending_job_keys: dict[int, list[OffloadKey]] = {}
         # Step 1.5 (semantic prefetch) needs a live reference to the
         # scheduler's GPU BlockPool to reserve a small budget of blocks
@@ -730,13 +734,11 @@ class SemanticOffloadingConnector(OffloadingConnector):
         # throwing away) a whole extra SemanticOffloadingManager -- wasteful,
         # and avoidable by just not calling the redundant base constructor.
         KVConnectorBase_V1.__init__(self, vllm_config, role, kv_cache_config)
-        # create_spec's signature changed upstream (vLLM #48150, "Define
-        # clean backend configuration boundary") from (vllm_config,
-        # kv_cache_config) to a single translated OffloadingConfig -- mirror
-        # OffloadingConnector.__init__'s own real call site exactly
-        # (offloading_connector.py) rather than re-deriving the translation.
-        offloading_config = build_offloading_config(vllm_config, kv_cache_config)
-        spec = OffloadingSpecFactory.create_spec(offloading_config)
+        # create_spec()'s real signature varies by vLLM checkout (#48150
+        # changed it on some, not others still in use across this
+        # project's machines) -- see _vllm_compat.py, which inspects the
+        # real installed vLLM rather than assuming one shape.
+        spec = create_offloading_spec(vllm_config, kv_cache_config)
         self.connector_scheduler: OffloadingConnectorScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
         if role == KVConnectorRole.SCHEDULER:
@@ -744,8 +746,8 @@ class SemanticOffloadingConnector(OffloadingConnector):
                 spec, vllm_config, kv_cache_config
             )
         elif role == KVConnectorRole.WORKER:
-            self.connector_worker = SemanticOffloadingConnectorWorker(
-                spec, kv_cache_config
+            self.connector_worker = construct_worker(
+                SemanticOffloadingConnectorWorker, spec, kv_cache_config
             )
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:

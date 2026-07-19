@@ -45,6 +45,7 @@ import torch
 
 from semantic_offload._debug import TIMING as _TIMING
 from semantic_offload._debug import debug_print, record_timing
+from semantic_offload._vllm_compat import init_cpu_offloading_worker_base
 from semantic_offload.index import (
     BlockSummary,
     build_summary,
@@ -82,10 +83,13 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         method: str = "minmax",
         capture_stride: int = 1,
     ):
-        # CPUOffloadingWorker's param was renamed block_size_factor ->
-        # blocks_per_chunk upstream (vLLM #48150); matched here for
-        # consistency rather than translating at the call boundary.
-        super().__init__(
+        # CPUOffloadingWorker's own param is named block_size_factor or
+        # blocks_per_chunk depending on the installed vLLM's version
+        # (#48150 renamed it on some checkouts, not others still in use
+        # across this project's machines) -- call via whichever name the
+        # real base class actually declares. See _vllm_compat.py.
+        init_cpu_offloading_worker_base(
+            self,
             kv_caches=kv_caches,
             blocks_per_chunk=blocks_per_chunk,
             num_cpu_blocks=num_cpu_blocks,

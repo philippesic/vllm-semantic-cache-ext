@@ -8,6 +8,7 @@ Register via kv_connector_extra_config={"spec_name": "SemanticOffloadingSpec",
 
 from typing_extensions import override
 
+from semantic_offload._vllm_compat import spec_blocks_per_chunk
 from semantic_offload.manager import SemanticOffloadingManager
 from semantic_offload.worker import SemanticOffloadingWorker
 from vllm.v1.kv_offload.base import CanonicalKVCaches, OffloadingManager
@@ -30,9 +31,7 @@ class SemanticOffloadingSpec(CPUOffloadingSpec):
         capture_stride = int(self.extra_config.get("capture_stride", 1))
         return SemanticOffloadingWorker(
             kv_caches=kv_caches,
-            # OffloadingSpec's own attribute was renamed block_size_factor ->
-            # blocks_per_chunk upstream (vLLM #48150).
-            blocks_per_chunk=self.blocks_per_chunk,
+            blocks_per_chunk=spec_blocks_per_chunk(self),
             num_cpu_blocks=self.num_blocks,
             vllm_config=self.vllm_config,
             method=method,

@@ -158,7 +158,7 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
             self._query_capture_mode = install_query_capture(
                 vllm_config,
                 self._probe_layer_name,
-                self._on_query_captured,
+                self._on_queries_captured,
                 num_queries_per_kv=num_queries_per_kv,
                 capture_stride=capture_stride,
             )
@@ -220,12 +220,25 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         self._stack_cache_dirty = False
 
     def _on_query_captured(self, req_id: str, query_repr: torch.Tensor) -> None:
-        if not self.durable_summaries:
+        """Single-request convenience wrapper over `_on_queries_captured`
+        (tests and any external caller; the live capture path calls the
+        batched form directly, once per step)."""
+        self._on_queries_captured([req_id], query_repr.unsqueeze(0))
+
+    def _on_queries_captured(self, req_ids: list[str], queries: torch.Tensor) -> None:
+        if not self.durable_summaries or not req_ids:
             return
         _t_call = time.perf_counter() if _TIMING else 0.0
-        # query_repr: [num_kv_heads, head_dim]. summaries are fp32 (Step 1.2
-        # upcast).
-        query_repr = query_repr.float()
+        # queries: [n_reqs, num_kv_heads, head_dim] -- one row per request
+        # scheduled in this step. All concurrent requests are scored in ONE
+        # batched pass with ONE GPU sync per step, instead of one pass-plus-
+        # sync per request: per-call cost is flat (~1ms), but the capture
+        # loop fires once per scheduled request per eligible step, so at
+        # saturation the per-request loop's aggregate (~n_reqs x ~1ms/step,
+        # n_reqs measured ~56 on the dev box) was the largest per-step cost
+        # bucket -- see the cross-request batching entry in the issues log.
+        # summaries are fp32 (Step 1.2 upcast).
+        queries = queries.float()
 
         # Score and keep EVERY resident summary, not just a top-M slice. A
         # prior `_TOP_M=8` cap here meant most of a request's own blocks
@@ -260,7 +273,11 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         keys = self._stack_cache_keys
         cache = self._stack_cache
 
-        query = query_repr.unsqueeze(0)  # [1, num_kv_heads, head_dim]
+        # [n_reqs, 1, num_kv_heads, head_dim] broadcasts against the
+        # [n_candidates, num_kv_heads, head_dim] stacks to score every
+        # (request, candidate) pair in one op -- the score_*_batch functions
+        # are broadcast-shape-agnostic, so no index.py change is needed.
+        query = queries.unsqueeze(1)
         if self._method == "minmax":
             per_head = score_minmax_batch(query, cache["max"], cache["min"])
         elif self._method == "mean":
@@ -270,25 +287,25 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         # Per-head score, combined via max across heads -- different KV
         # heads may specialize on different content, so the head most
         # aligned with this query should drive the block's relevance
-        # (entry #9). One sync for the whole batch (.tolist()), not one
-        # per candidate.
+        # (entry #9). One sync for the whole step's batch (.tolist()), not
+        # one per request or per candidate.
         _t_sync = time.perf_counter() if _TIMING else 0.0
-        scores = per_head.max(dim=-1).values.tolist()
+        # [n_reqs, n_candidates] -> list of per-request score lists.
+        all_scores = per_head.max(dim=-1).values.tolist()
         if _TIMING:
-            # This .tolist() is a GPU->CPU sync executed on the model compute
-            # stream, once per in-flight request per prefill step -- the
-            # suspected concurrency-scaling stall (issues log open item #1).
             record_timing("query_captured_sync", time.perf_counter() - _t_sync)
-        ranked = sorted(zip(keys, scores), key=lambda kv: kv[1], reverse=True)
-        self._pending_scores.setdefault(self._method, {})[req_id] = ranked
+        method_scores = self._pending_scores.setdefault(self._method, {})
+        for req_id, scores in zip(req_ids, all_scores):
+            ranked = sorted(zip(keys, scores), key=lambda kv: kv[1], reverse=True)
+            method_scores[req_id] = ranked
+            debug_print(
+                f"SEMANTIC_STEP1_3_DEBUG req={req_id} method={self._method} "
+                f"n_summaries={len(self.durable_summaries)} "
+                f"ranked_keys={[k.hex()[:8] for k, _ in ranked]} "
+                f"scores={[round(s, 4) for _, s in ranked]}"
+            )
         if _TIMING:
             record_timing("query_captured_total", time.perf_counter() - _t_call)
-        debug_print(
-            f"SEMANTIC_STEP1_3_DEBUG req={req_id} method={self._method} "
-            f"n_summaries={len(self.durable_summaries)} "
-            f"ranked_keys={[k.hex()[:8] for k, _ in ranked]} "
-            f"scores={[round(s, 4) for _, s in ranked]}"
-        )
 
     def _check_layout(self, layer_name: str, layer, kv_cache: torch.Tensor) -> None:
         if layer_name in self._layout_checked:

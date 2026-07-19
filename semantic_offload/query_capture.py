@@ -86,14 +86,15 @@ def _should_sample_step(step_index: int, stride: int) -> bool:
 def install(
     vllm_config: VllmConfig,
     probe_layer_name: str,
-    on_query: Callable[[str, torch.Tensor], None],
+    on_query: Callable[[list[str], torch.Tensor], None],
     num_queries_per_kv: int = 1,
     capture_stride: int = 1,
 ) -> TorchDispatchMode:
-    """Install both patches. `on_query(req_id, query_repr)` fires once per
-    request per step whenever live query data is captured for the probe
-    layer -- `query_repr` is a `[num_kv_heads, head_dim]` tensor: the
-    request's last real token's query, grouped by which KV head each query
+    """Install both patches. `on_query(req_ids, query_reprs)` fires ONCE per
+    step whenever live query data is captured for the probe layer, covering
+    every request scheduled in that step -- `query_reprs` is a
+    `[len(req_ids), num_kv_heads, head_dim]` tensor: each request's last
+    real token's query, grouped by which KV head each query
     head attends against (GQA group, contiguous per
     triton_unified_attention.py's `query_offset_1 = kv_head_idx *
     num_queries_per_kv + ...` convention -- verified against this backend's
@@ -155,19 +156,29 @@ def install(
                     # construction) -- an exact-length check here silently
                     # dropped every short (needle-sized) prefill, since only
                     # large prefills happen to land on an unpadded shape.
+                    req_ids = []
+                    last_indices = []
                     for req_id, (start, end) in zip(layout.req_ids, layout.boundaries):
                         if end > start:
-                            # Last-token query repr, grouped per KV head
-                            # (entry #9) -- shape [num_query_heads, head_dim]
-                            # -> [num_kv_heads, num_queries_per_kv, head_dim]
-                            # -> mean within group -> [num_kv_heads, head_dim].
-                            last_q = query[end - 1]
-                            num_query_heads, head_dim = last_q.shape
-                            num_kv_heads = num_query_heads // num_queries_per_kv
-                            grouped = last_q.view(
-                                num_kv_heads, num_queries_per_kv, head_dim
-                            ).mean(dim=1)
-                            on_query(req_id, grouped)
+                            req_ids.append(req_id)
+                            last_indices.append(end - 1)
+                    if req_ids:
+                        # Last-token query reprs for ALL requests in this
+                        # step, gathered/grouped in one batched op and
+                        # delivered via ONE callback per step -- per-request
+                        # calls made capture cost scale linearly with the
+                        # concurrent-request count (see worker.py's
+                        # _on_queries_captured). Per request: shape
+                        # [num_query_heads, head_dim] -> [num_kv_heads,
+                        # num_queries_per_kv, head_dim] -> mean within the
+                        # GQA group (entry #9) -> [num_kv_heads, head_dim].
+                        last_q = query[torch.tensor(last_indices, device=query.device)]
+                        n_reqs, num_query_heads, head_dim = last_q.shape
+                        num_kv_heads = num_query_heads // num_queries_per_kv
+                        grouped = last_q.view(
+                            n_reqs, num_kv_heads, num_queries_per_kv, head_dim
+                        ).mean(dim=2)
+                        on_query(req_ids, grouped)
             return func(*args, **kwargs)
 
     mode = ProbeMode()

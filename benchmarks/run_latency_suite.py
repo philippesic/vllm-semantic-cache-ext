@@ -113,11 +113,26 @@ def _seed_tag(seed: int | None) -> str:
 
 def parse_vllm_bench_result(result_json_path: str) -> dict:
     """Pure, unit-testable: extract the fields we care about from a real
-    `vllm bench serve --save-result` JSON file into our flat row shape."""
+    `vllm bench serve --save-result` JSON file into our flat row shape.
+
+    Includes `completed` (not part of RESULT_FIELDS -- callers must pop it
+    before handing the row to the CSV writer) so `run_vllm_bench_serve` can
+    detect a zero-completions run: `vllm`'s own `calculate_metrics`
+    (`vllm/benchmarks/serve.py`) computes every percentile as
+    `np.percentile(ttfts or 0, p)`, which is exactly `0.0` when `ttfts` is
+    empty (no request both succeeded and reported a streamed first token).
+    Silently returning that 0.0 is indistinguishable from a real,
+    fast TTFT -- this is the mixed workload's rag/longdoc sub-streams
+    reporting `ttft_p50=0.0` for every policy (issues log entry #76): under
+    the concurrent chat+rag+longdoc+needle load `mixed` puts on one server,
+    those two much-larger-prompt sub-streams are the ones most likely to
+    see a degenerate 0-completion run, and the bare percentile number gives
+    no way to tell that apart from a genuine (if surprising) fast TTFT."""
     with open(result_json_path) as f:
         data = json.load(f)
     return {
         "duration_s": data.get("duration"),
+        "completed": data.get("completed"),
         "ttft_p50_ms": data.get("p50_ttft_ms"),
         "ttft_p90_ms": data.get("p90_ttft_ms"),
         "ttft_p99_ms": data.get("p99_ttft_ms"),
@@ -168,6 +183,26 @@ def resolve_num_prompts(
     return resolved
 
 
+def resolve_needle_num_distractors(
+    needle_num_prompts: int, explicit: int | None
+) -> int:
+    """Pure, unit-testable: the needle-case distractor count, held CONSTANT
+    across every `reference_count` in a run.
+
+    Previously this was computed inline as `max(1, needle_num_prompts -
+    reference_count)`, which silently confounds "was the needle referenced"
+    with "how much total distractor traffic ran before recall" -- higher
+    reference_count meant fewer distractors, by construction, since probes
+    and distractors shared one fixed prompt budget. Issues log entry #77
+    caught this via a clean negative control: `arc`, which has zero
+    content-awareness, showed the SAME hit-at-reference_count>=1 pattern
+    semantic did, which is only possible if less traffic (not "was
+    referenced") is what's actually driving the result. Decoupling the two
+    (this function never takes `reference_count` as an input) removes the
+    confound structurally rather than by convention."""
+    return explicit if explicit is not None else needle_num_prompts
+
+
 def run_vllm_bench_serve(
     base_url: str,
     model: str,
@@ -210,7 +245,20 @@ def run_vllm_bench_serve(
         return {"error": f"vllm bench serve failed: {proc.stderr[-2000:]}"}
     if not os.path.exists(result_path):
         return {"error": f"vllm bench serve produced no result file at {result_path}"}
-    return parse_vllm_bench_result(result_path)
+    row = parse_vllm_bench_result(result_path)
+    completed = row.pop("completed", None)
+    if not completed:
+        return {
+            "error": (
+                f"vllm bench serve completed {completed or 0}/{num_prompts} "
+                "requests -- reported ttft/itl/throughput would be "
+                "degenerate zeros, not a real measurement (vllm's own "
+                "calculate_metrics reports 0.0 for every percentile when no "
+                "request both succeeded and streamed a first token); see "
+                f"{result_path}'s 'errors' field for why requests failed"
+            )
+        }
+    return row
 
 
 def run_mixed_case(
@@ -223,6 +271,7 @@ def run_mixed_case(
     scale: float,
     seed: int | None,
     ref_counts: list[int],
+    metrics_url: str | None = None,
 ) -> list[dict]:
     """`mixed`: chat/rag/longdoc run concurrently (via `vllm bench serve`
     sub-streams in parallel threads, proportioned by
@@ -234,7 +283,42 @@ def run_mixed_case(
     metric shapes (TTFT/ITL percentiles vs. a hit/miss rate) that don't
     average meaningfully. Each sub-stream's own failure (e.g. a stalled
     request, see vLLM issue #45388) is caught independently so one bad
-    sub-stream doesn't lose the others' real data."""
+    sub-stream doesn't lose the others' real data.
+
+    `metrics_url`, when given, is used to snapshot the offload-subsystem
+    Prometheus counters (`harness.metrics`) around EACH sub-stream/needle-
+    case individually (issues log entry #76: the previous design took one
+    snapshot pair around the whole concurrent call and copied the same
+    aggregate `load_bytes_delta` onto every row via `setdefault` -- in
+    practice that produced no usable per-row signal at all). Per-row
+    snapshots are still an approximation, not exact attribution: the four
+    streams share one live server and one set of global counters, so bytes
+    another still-running stream moves during a given row's own window can
+    bleed into that row's delta. That's strictly better than one shared
+    number on every row, but still coarser than the standalone workloads'
+    single-stream-at-a-time deltas -- worth keeping in mind when reading
+    `mixed`'s per-row cache-hit volume. Without `metrics_url` (e.g. unit
+    tests that don't stand up a real server) the byte/preemption fields are
+    left `None` rather than guessed at."""
+
+    def _snap() -> dict[str, float] | None:
+        return metrics_mod.snapshot(metrics_url) if metrics_url else None
+
+    def _delta_fields(
+        before: dict[str, float] | None, after: dict[str, float] | None
+    ) -> dict[str, float | None]:
+        if before is None or after is None:
+            return {
+                "load_bytes_delta": None,
+                "store_bytes_delta": None,
+                "preemptions_delta": None,
+            }
+        delta = metrics_mod.diff(before, after)
+        return {
+            "load_bytes_delta": delta.get("vllm:kv_offload_load_bytes_total"),
+            "store_bytes_delta": delta.get("vllm:kv_offload_store_bytes_total"),
+            "preemptions_delta": delta.get("vllm:num_preemptions_total"),
+        }
 
     def _run_sub(sub_workload: str, weight: float) -> dict:
         sub_rate = rate * weight if rate != float("inf") else rate
@@ -243,6 +327,7 @@ def run_mixed_case(
             output_dir,
             f"raw_{policy}_mixed-{sub_workload}_{rate}_{_seed_tag(seed)}.json",
         )
+        before = _snap()
         try:
             if (
                 sub_workload == "rag"
@@ -266,6 +351,8 @@ def run_mixed_case(
             )
         except Exception as e:
             row = {"error": str(e)[:500]}
+        after = _snap()
+        row.update(_delta_fields(before, after))
         row.update(
             {
                 "policy": policy,
@@ -293,26 +380,50 @@ def run_mixed_case(
                 "sub_workload": "needle",
                 "reference_count": ref_count,
             }
+            before = _snap()
             try:
-                result = needle_workload.run_needle_case(
+                # needle-v2's preservation-aware classification (issues log
+                # entry #58), not the old `run_needle_case`'s `expected_code
+                # in recall_text` check -- that check is mathematically
+                # pinned to 1.0 for every policy under vLLM's lossless
+                # offload path (the recall always recomputes the right
+                # answer whether or not the cache preserved it), which is
+                # exactly why `mixed`'s needle sub-stream read a constant
+                # 1.0 `needle_hit_rate` regardless of real eviction
+                # behavior. `run_needle_v2_case` isolates the recall's own
+                # CPU-tier load/store bytes and classifies hit/miss/
+                # not_pressured from those, same as the standalone
+                # `needle-v2` workload branch in `main()`.
+                result = needle_workload.run_needle_v2_case(
                     base_url,
                     reference_count=ref_count,
                     num_distractors=max(1, 10 - ref_count),
                     model=model,
                     seed=1_000_000 + i,
+                    snapshot_metrics=_snap if metrics_url else None,
                 )
-                row["needle_hit_rate"] = 1.0 if result["hit"] else 0.0
+                row["needle_outcome"] = result["needle_outcome"]
+                row["recall_load_bytes"] = result["recall_load_bytes"]
+                row["recall_store_bytes"] = result["recall_store_bytes"]
+                if result["needle_outcome"] is not None:
+                    row["needle_hit_rate"] = (
+                        1.0
+                        if result["needle_outcome"] == needle_workload.NEEDLE_HIT
+                        else 0.0
+                    )
             except Exception as e:
                 row["error"] = str(e)[:500]
+            after = _snap()
+            row.update(_delta_fields(before, after))
             rows.append(row)
         return rows
 
     rows = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-        sub_futures = {
-            ex.submit(_run_sub, name, weight): name
+        sub_futures = [
+            ex.submit(_run_sub, name, weight)
             for name, weight in _MIXED_SUBWORKLOAD_WEIGHTS.items()
-        }
+        ]
         needle_future = ex.submit(_run_needle_stream)
         for fut in concurrent.futures.as_completed(sub_futures):
             rows.append(fut.result())
@@ -347,6 +458,44 @@ def main():
     parser.add_argument("--request-rates", default="inf", help="comma-separated")
     parser.add_argument(
         "--needle-reference-counts", default="0,1,2", help="comma-separated"
+    )
+    parser.add_argument(
+        "--needle-num-distractors",
+        type=int,
+        default=None,
+        help=(
+            "fixed distractor count for every needle/needle-v2 case, held "
+            "constant across all --needle-reference-counts values in this "
+            "run. Defaults to needle_num_prompts (--num-prompts, or the "
+            "target-duration-derived estimate) when unset. Deliberately "
+            "does NOT scale with reference_count -- see issues log entry "
+            "#77: subtracting reference_count from a shared prompt budget "
+            "confounded 'was referenced' with 'less total distractor "
+            "traffic before recall'."
+        ),
+    )
+    parser.add_argument(
+        "--needle-settle-s",
+        type=float,
+        default=1.0,
+        help=(
+            "needle-v2 only: seconds between polls while waiting for the "
+            "distractor store counter to stop moving before snapshotting "
+            "the recall's 'before' baseline (see needle_workload."
+            "_drain_store_counter). Under heavy host contention (e.g. an "
+            "8-GPU concurrent grid sharing host CPU/RAM/PCIe bandwidth for "
+            "CPU-tier offload), the default may settle too early and "
+            "contaminate the recall-isolated delta -- raise this and/or "
+            "--needle-max-settle-polls if grid runs show settle-exhausted "
+            "warnings that isolated single-GPU runs don't (entry #77)."
+        ),
+    )
+    parser.add_argument(
+        "--needle-max-settle-polls",
+        type=int,
+        default=5,
+        help="needle-v2 only: max polls in the store-counter settle wait "
+        "above, before giving up and using the last-read snapshot anyway.",
     )
     parser.add_argument(
         "--num-prompts",
@@ -449,6 +598,9 @@ def main():
             needle_num_prompts = args.num_prompts or max(
                 1, round(args.target_duration_s / 15)
             )
+            needle_num_distractors = resolve_needle_num_distractors(
+                needle_num_prompts, args.needle_num_distractors
+            )
 
             try:
                 for workload in workloads:
@@ -459,9 +611,7 @@ def main():
                                 result = needle_workload.run_needle_case(
                                     handle.base_url(),
                                     reference_count=ref_count,
-                                    num_distractors=max(
-                                        1, needle_num_prompts - ref_count
-                                    ),
+                                    num_distractors=needle_num_distractors,
                                     model=args.model,
                                     seed=ref_count,
                                 )
@@ -524,12 +674,12 @@ def main():
                                 result = needle_workload.run_needle_v2_case(
                                     handle.base_url(),
                                     reference_count=ref_count,
-                                    num_distractors=max(
-                                        1, needle_num_prompts - ref_count
-                                    ),
+                                    num_distractors=needle_num_distractors,
                                     model=args.model,
                                     seed=ref_count,
                                     snapshot_metrics=_snap,
+                                    settle_s=args.needle_settle_s,
+                                    max_settle_polls=args.needle_max_settle_polls,
                                 )
                                 after = _snap()
                                 delta = metrics_mod.diff(before, after)
@@ -593,6 +743,7 @@ def main():
                                     args.scale,
                                     args.seed,
                                     ref_counts,
+                                    metrics_url=handle.metrics_url(),
                                 )
                             except Exception as e:
                                 print(
@@ -612,6 +763,12 @@ def main():
                                 ]
                             after = metrics_mod.snapshot(handle.metrics_url())
                             delta = metrics_mod.diff(before, after)
+                            # run_mixed_case already attributes its own
+                            # per-row byte/preemption deltas (issues log
+                            # entry #76) -- these setdefaults are only a
+                            # fallback for the single synthetic error row
+                            # produced above when run_mixed_case raised
+                            # before populating anything itself.
                             for row in mixed_rows:
                                 row.setdefault(
                                     "load_bytes_delta",

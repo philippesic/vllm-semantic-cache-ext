@@ -216,6 +216,39 @@ def test_classify_needle_outcome_prefers_hit_even_if_store_also_moved():
     )
 
 
+def test_drain_store_counter_returns_once_stable():
+    """Stops polling as soon as two consecutive reads agree, returning that
+    stable snapshot (not the last-changing one)."""
+    readings = iter(
+        [
+            {"vllm:kv_offload_store_bytes_total": 100.0},  # initial
+            {"vllm:kv_offload_store_bytes_total": 200.0},  # still moving
+            {"vllm:kv_offload_store_bytes_total": 200.0},  # stable
+        ]
+    )
+    result = needle_workload._drain_store_counter(
+        lambda: next(readings), settle_s=0.0, max_polls=5
+    )
+    assert result == {"vllm:kv_offload_store_bytes_total": 200.0}
+
+
+def test_drain_store_counter_warns_and_returns_last_reading_on_exhaustion(capsys):
+    """A counter that never stops moving within max_polls must not hang or
+    raise -- it returns the last-read snapshot and prints a WARNING (the
+    entry #77 diagnostic signal for grid-concurrency contention)."""
+    counter = {"v": 0.0}
+
+    def always_moving():
+        counter["v"] += 1.0
+        return {"vllm:kv_offload_store_bytes_total": counter["v"]}
+
+    result = needle_workload._drain_store_counter(
+        always_moving, settle_s=0.0, max_polls=3
+    )
+    assert result == {"vllm:kv_offload_store_bytes_total": 4.0}
+    assert "WARNING" in capsys.readouterr().out
+
+
 def test_run_needle_v2_case_classifies_from_recall_isolated_deltas():
     """run_needle_v2_case must snapshot metrics around the RECALL request
     alone, so the outcome reflects the recall's own CPU-tier interaction and
@@ -340,13 +373,27 @@ def test_mixed_case_produces_one_row_per_subworkload_plus_needle_rows():
     ):
         return {"duration_s": 1.0, "throughput_tok_s": 42.0}
 
-    def fake_needle_case(base_url, *, reference_count, num_distractors, model, seed):
-        return {"hit": True}
+    def fake_needle_v2_case(
+        base_url,
+        *,
+        reference_count,
+        num_distractors,
+        model,
+        seed,
+        snapshot_metrics=None,
+    ):
+        return {
+            "needle_outcome": needle_workload.NEEDLE_HIT,
+            "recall_load_bytes": 4096.0,
+            "recall_store_bytes": 0.0,
+        }
 
     with (
         patch.object(rls, "run_vllm_bench_serve", side_effect=fake_bench_serve),
         patch.object(
-            rls.needle_workload, "run_needle_case", side_effect=fake_needle_case
+            rls.needle_workload,
+            "run_needle_v2_case",
+            side_effect=fake_needle_v2_case,
         ),
     ):
         rows = rls.run_mixed_case(
@@ -369,6 +416,9 @@ def test_mixed_case_produces_one_row_per_subworkload_plus_needle_rows():
     chat_row = next(r for r in rows if r["sub_workload"] == "chat")
     assert chat_row["num_prompts"] == round(600 * 0.40)
     assert chat_row["request_rate"] == pytest.approx(10.0 * 0.40)
+    needle_row = next(r for r in rows if r["sub_workload"] == "needle")
+    assert needle_row["needle_outcome"] == needle_workload.NEEDLE_HIT
+    assert needle_row["needle_hit_rate"] == 1.0
 
 
 def test_mixed_case_isolates_one_subworkload_failure():
@@ -383,13 +433,27 @@ def test_mixed_case_isolates_one_subworkload_failure():
             raise RuntimeError("simulated stall (vLLM issue #45388)")
         return {"duration_s": 1.0, "throughput_tok_s": 42.0}
 
-    def fake_needle_case(base_url, *, reference_count, num_distractors, model, seed):
-        return {"hit": False}
+    def fake_needle_v2_case(
+        base_url,
+        *,
+        reference_count,
+        num_distractors,
+        model,
+        seed,
+        snapshot_metrics=None,
+    ):
+        return {
+            "needle_outcome": needle_workload.NEEDLE_MISS,
+            "recall_load_bytes": 0.0,
+            "recall_store_bytes": 2048.0,
+        }
 
     with (
         patch.object(rls, "run_vllm_bench_serve", side_effect=flaky_bench_serve),
         patch.object(
-            rls.needle_workload, "run_needle_case", side_effect=fake_needle_case
+            rls.needle_workload,
+            "run_needle_v2_case",
+            side_effect=fake_needle_v2_case,
         ),
     ):
         rows = rls.run_mixed_case(
@@ -401,6 +465,259 @@ def test_mixed_case_isolates_one_subworkload_failure():
     assert "error" not in by_sub["chat"]
     assert "error" not in by_sub["longdoc"]
     assert by_sub["needle"]["needle_hit_rate"] == 0.0
+    assert by_sub["needle"]["needle_outcome"] == needle_workload.NEEDLE_MISS
+
+
+def test_mixed_case_needle_stream_uses_needle_v2_classification_not_string_match():
+    """Regression for issues log entry #76 bug 2: `mixed`'s needle
+    sub-stream used to call the old `run_needle_case` (`expected_code in
+    recall_text`), which is mathematically pinned to a `hit` (1.0) for
+    every policy under vLLM's lossless offload path (issues log entry #58)
+    -- it can never observe a real eviction. This asserts the needle
+    sub-stream reads its outcome from `run_needle_v2_case`'s recall-
+    isolated byte classification instead, so a real MISS (no load bytes,
+    only store bytes on the recall) surfaces as `needle_hit_rate == 0.0`,
+    not the old metric's constant 1.0."""
+    from unittest.mock import patch
+
+    import benchmarks.run_latency_suite as rls
+
+    def fake_bench_serve(
+        base_url, model, workload, num_prompts, rate, scale, path, seed=None
+    ):
+        return {"duration_s": 1.0, "throughput_tok_s": 42.0}
+
+    def fake_needle_v2_case(
+        base_url,
+        *,
+        reference_count,
+        num_distractors,
+        model,
+        seed,
+        snapshot_metrics=None,
+    ):
+        # Real eviction: recall had to recompute (store, no load) -- a
+        # genuine miss that the old string-match check could never report.
+        return {
+            "needle_outcome": needle_workload.NEEDLE_MISS,
+            "recall_load_bytes": 0.0,
+            "recall_store_bytes": 1024.0,
+        }
+
+    with (
+        patch.object(rls, "run_vllm_bench_serve", side_effect=fake_bench_serve),
+        patch.object(
+            rls.needle_workload,
+            "run_needle_v2_case",
+            side_effect=fake_needle_v2_case,
+        ) as mock_v2,
+        patch.object(rls.needle_workload, "run_needle_case") as mock_v1,
+    ):
+        rows = rls.run_mixed_case(
+            "http://x", "model", "/tmp", "lru", 1.0, 20, 1.0, None, [0]
+        )
+
+    assert mock_v2.called
+    assert not mock_v1.called
+    needle_row = next(r for r in rows if r["sub_workload"] == "needle")
+    assert needle_row["needle_outcome"] == needle_workload.NEEDLE_MISS
+    assert needle_row["needle_hit_rate"] == 0.0
+    assert needle_row["recall_load_bytes"] == 0.0
+    assert needle_row["recall_store_bytes"] == 1024.0
+
+
+def test_mixed_case_populates_load_bytes_delta_per_row_when_metrics_url_given():
+    """Regression for issues log entry #76 bug 3: `load_bytes_delta` was
+    genuinely unpopulated (not just zero) for every `mixed` row. Given a
+    fake metrics endpoint whose load-byte counter advances between the
+    before/after snapshot each sub-stream/needle-case takes, every row --
+    every sub_workload, including needle -- must come back with a real
+    (non-None) `load_bytes_delta`."""
+    from unittest.mock import patch
+
+    import benchmarks.run_latency_suite as rls
+
+    counter = {"n": 0.0}
+
+    def fake_snapshot(metrics_url):
+        counter["n"] += 100.0
+        return {
+            "vllm:kv_offload_load_bytes_total": counter["n"],
+            "vllm:kv_offload_store_bytes_total": 0.0,
+            "vllm:num_preemptions_total": 0.0,
+        }
+
+    def fake_bench_serve(
+        base_url, model, workload, num_prompts, rate, scale, path, seed=None
+    ):
+        return {"duration_s": 1.0, "throughput_tok_s": 42.0}
+
+    def fake_needle_v2_case(
+        base_url,
+        *,
+        reference_count,
+        num_distractors,
+        model,
+        seed,
+        snapshot_metrics=None,
+    ):
+        return {
+            "needle_outcome": needle_workload.NEEDLE_HIT,
+            "recall_load_bytes": 200.0,
+            "recall_store_bytes": 0.0,
+        }
+
+    with (
+        patch.object(rls, "run_vllm_bench_serve", side_effect=fake_bench_serve),
+        patch.object(
+            rls.needle_workload,
+            "run_needle_v2_case",
+            side_effect=fake_needle_v2_case,
+        ),
+        patch.object(rls.metrics_mod, "snapshot", side_effect=fake_snapshot),
+    ):
+        rows = rls.run_mixed_case(
+            "http://x",
+            "model",
+            "/tmp",
+            "semantic-minmax",
+            10.0,
+            600,
+            1.0,
+            None,
+            [0, 1],
+            metrics_url="http://x/metrics",
+        )
+
+    for row in rows:
+        assert row["load_bytes_delta"] is not None
+        assert row["load_bytes_delta"] > 0
+
+
+def test_mixed_case_load_bytes_delta_is_none_without_metrics_url():
+    """Without a metrics_url (e.g. an environment that can't reach a real
+    server), the harness must not fabricate a number -- None, not a
+    misleading 0.0, so a blank CSV field is honestly "not measured"."""
+    from unittest.mock import patch
+
+    import benchmarks.run_latency_suite as rls
+
+    def fake_bench_serve(
+        base_url, model, workload, num_prompts, rate, scale, path, seed=None
+    ):
+        return {"duration_s": 1.0, "throughput_tok_s": 42.0}
+
+    def fake_needle_v2_case(
+        base_url,
+        *,
+        reference_count,
+        num_distractors,
+        model,
+        seed,
+        snapshot_metrics=None,
+    ):
+        return {
+            "needle_outcome": None,
+            "recall_load_bytes": None,
+            "recall_store_bytes": None,
+        }
+
+    with (
+        patch.object(rls, "run_vllm_bench_serve", side_effect=fake_bench_serve),
+        patch.object(
+            rls.needle_workload,
+            "run_needle_v2_case",
+            side_effect=fake_needle_v2_case,
+        ),
+    ):
+        rows = rls.run_mixed_case(
+            "http://x", "model", "/tmp", "lru", 10.0, 100, 1.0, None, [0]
+        )
+
+    for row in rows:
+        assert row["load_bytes_delta"] is None
+
+
+def test_run_vllm_bench_serve_surfaces_zero_completions_as_error():
+    """Regression for issues log entry #76 bug 1: vllm's own
+    calculate_metrics (vllm/benchmarks/serve.py) reports every ttft/itl
+    percentile as a literal 0.0 when no request both succeeded and
+    streamed a first token (`np.percentile(ttfts or 0, p)` with an empty
+    `ttfts` list) -- exactly the `ttft_p50=0.0` `mixed` reported for the
+    rag/longdoc sub-streams under concurrent load, for every policy. A
+    completed=0 result must surface as an explicit error, not a silently
+    degenerate 0.0 TTFT row."""
+    from unittest.mock import patch
+
+    import benchmarks.run_latency_suite as rls
+
+    payload = {
+        "duration": 12.5,
+        "completed": 0,
+        "p50_ttft_ms": 0.0,
+        "p90_ttft_ms": 0.0,
+        "p99_ttft_ms": 0.0,
+        "p50_itl_ms": 0.0,
+        "p90_itl_ms": 0.0,
+        "p99_itl_ms": 0.0,
+        "output_throughput": 0.0,
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(payload, f)
+        path = f.name
+    try:
+
+        class _FakeProc:
+            returncode = 0
+            stderr = ""
+
+        with patch.object(rls.subprocess, "run", return_value=_FakeProc()):
+            row = rls.run_vllm_bench_serve(
+                "http://x", "model", "rag", 10, 1.0, 1.0, path, seed=None
+            )
+    finally:
+        os.unlink(path)
+
+    assert "error" in row
+    assert "completed 0/10" in row["error"]
+    assert "ttft_p50_ms" not in row
+
+
+def test_run_vllm_bench_serve_returns_real_ttft_when_requests_complete():
+    from unittest.mock import patch
+
+    import benchmarks.run_latency_suite as rls
+
+    payload = {
+        "duration": 12.5,
+        "completed": 10,
+        "p50_ttft_ms": 45.0,
+        "p90_ttft_ms": 90.0,
+        "p99_ttft_ms": 120.0,
+        "p50_itl_ms": 5.0,
+        "p90_itl_ms": 6.0,
+        "p99_itl_ms": 7.0,
+        "output_throughput": 100.0,
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(payload, f)
+        path = f.name
+    try:
+
+        class _FakeProc:
+            returncode = 0
+            stderr = ""
+
+        with patch.object(rls.subprocess, "run", return_value=_FakeProc()):
+            row = rls.run_vllm_bench_serve(
+                "http://x", "model", "rag", 10, 1.0, 1.0, path, seed=None
+            )
+    finally:
+        os.unlink(path)
+
+    assert "error" not in row
+    assert row["ttft_p50_ms"] == 45.0
+    assert "completed" not in row
 
 
 def test_resolve_num_prompts_from_target_duration():
@@ -443,6 +760,35 @@ def test_resolve_num_prompts_allows_at_or_above_workload_minimum():
 
     assert resolve_num_prompts(0.15, None, 600.0, min_num_prompts=10) == 90
     assert resolve_num_prompts(2.0, 10, None, min_num_prompts=10) == 10
+
+
+def test_resolve_needle_num_distractors_defaults_to_needle_num_prompts():
+    from benchmarks.run_latency_suite import resolve_needle_num_distractors
+
+    assert resolve_needle_num_distractors(25, None) == 25
+
+
+def test_resolve_needle_num_distractors_explicit_value_wins():
+    from benchmarks.run_latency_suite import resolve_needle_num_distractors
+
+    assert resolve_needle_num_distractors(25, 40) == 40
+
+
+def test_resolve_needle_num_distractors_is_independent_of_reference_count():
+    """The regression test for issues log entry #77's confound: the old
+    inline computation was `max(1, needle_num_prompts - reference_count)`,
+    so distractor volume silently shrank as reference_count grew. This
+    function's signature has no reference_count parameter at all -- calling
+    it with the same (needle_num_prompts, explicit) pair must always return
+    the same distractor count, regardless of which reference_count a caller
+    is about to run, which is the actual property that closes the confound
+    (not just a particular return value)."""
+    from benchmarks.run_latency_suite import resolve_needle_num_distractors
+
+    for _reference_count in (0, 1, 2, 5):
+        # simulates what main() does per ref_count in its loop -- the call
+        # itself can't even take reference_count as an input.
+        assert resolve_needle_num_distractors(25, None) == 25
 
 
 def test_check_existing_schema_accepts_matching_header(tmp_path):
@@ -579,6 +925,74 @@ def test_grid_sweep_cell_args_omit_extra_config_by_default():
         output_dir="/tmp/out",
     )
     assert "--extra-config" not in args
+
+
+def test_grid_sweep_cell_args_forward_needle_knobs_when_given():
+    """Regression: entry #68 found --extra-config was missing from this
+    driver's passthrough for a whole session before being added; entry #77's
+    new --needle-num-distractors/--needle-settle-s/--needle-max-settle-polls
+    knobs must not repeat that gap -- they need to reach each cell's real
+    run_latency_suite.py invocation, not just the single-cell script, to be
+    usable in an actual multi-GPU grid run."""
+    from benchmarks.run_grid_sweep import build_run_latency_suite_args
+
+    args = build_run_latency_suite_args(
+        model="m",
+        policy="semantic-minmax",
+        workloads="needle-v2",
+        request_rates="inf",
+        needle_reference_counts="0,1,2",
+        target_duration_s=None,
+        num_prompts=25,
+        scale=1.0,
+        cpu_bytes_to_use=1000,
+        gpu_memory_utilization=0.5,
+        max_model_len=2048,
+        num_gpu_blocks_override=200,
+        port=8199,
+        seed=7,
+        output_dir="/tmp/out",
+        needle_num_distractors=25,
+        needle_settle_s=3.0,
+        needle_max_settle_polls=10,
+    )
+    assert (
+        "--needle-num-distractors" in args
+        and args[args.index("--needle-num-distractors") + 1] == "25"
+    )
+    assert (
+        "--needle-settle-s" in args
+        and args[args.index("--needle-settle-s") + 1] == "3.0"
+    )
+    assert (
+        "--needle-max-settle-polls" in args
+        and args[args.index("--needle-max-settle-polls") + 1] == "10"
+    )
+
+
+def test_grid_sweep_cell_args_omit_needle_knobs_by_default():
+    from benchmarks.run_grid_sweep import build_run_latency_suite_args
+
+    args = build_run_latency_suite_args(
+        model="m",
+        policy="lru",
+        workloads="chat",
+        request_rates="2.0",
+        needle_reference_counts="0",
+        target_duration_s=None,
+        num_prompts=20,
+        scale=1.0,
+        cpu_bytes_to_use=1000,
+        gpu_memory_utilization=0.5,
+        max_model_len=2048,
+        num_gpu_blocks_override=None,
+        port=8199,
+        seed=1,
+        output_dir="/tmp/out",
+    )
+    assert "--needle-num-distractors" not in args
+    assert "--needle-settle-s" not in args
+    assert "--needle-max-settle-polls" not in args
 
 
 def test_build_slots_assigns_unique_port_and_output_dir_per_gpu():

@@ -106,6 +106,9 @@ def build_run_latency_suite_args(
     seed: int,
     output_dir: str,
     extra_config: str | None = None,
+    needle_num_distractors: int | None = None,
+    needle_settle_s: float | None = None,
+    needle_max_settle_polls: int | None = None,
 ) -> list[str]:
     """Pure, unit-testable: the argv for one (policy, seed) cell. Kept
     separate from the actual subprocess-launching loop below."""
@@ -143,6 +146,12 @@ def build_run_latency_suite_args(
         args += ["--num-prompts", str(num_prompts)]
     if extra_config is not None:
         args += ["--extra-config", extra_config]
+    if needle_num_distractors is not None:
+        args += ["--needle-num-distractors", str(needle_num_distractors)]
+    if needle_settle_s is not None:
+        args += ["--needle-settle-s", str(needle_settle_s)]
+    if needle_max_settle_polls is not None:
+        args += ["--needle-max-settle-polls", str(needle_max_settle_polls)]
     return args
 
 
@@ -214,6 +223,27 @@ def main():
             "--extra-config (SemanticPolicy tuning knobs; ignored for "
             "lru/arc)."
         ),
+    )
+    parser.add_argument(
+        "--needle-num-distractors",
+        type=int,
+        default=None,
+        help="forwarded to each cell's run_latency_suite.py "
+        "--needle-num-distractors (see entry #77 confound fix).",
+    )
+    parser.add_argument(
+        "--needle-settle-s",
+        type=float,
+        default=None,
+        help="forwarded to each cell's run_latency_suite.py "
+        "--needle-settle-s; raise this for concurrent multi-GPU grids if "
+        "store-counter settle-exhausted warnings appear (see entry #77).",
+    )
+    parser.add_argument(
+        "--needle-max-settle-polls",
+        type=int,
+        default=None,
+        help="forwarded to each cell's run_latency_suite.py --needle-max-settle-polls.",
     )
     parser.add_argument(
         "--gpus",
@@ -289,6 +319,9 @@ def main():
                 seed=seed,
                 output_dir=slot["output_dir"],
                 extra_config=parsed.extra_config,
+                needle_num_distractors=parsed.needle_num_distractors,
+                needle_settle_s=parsed.needle_settle_s,
+                needle_max_settle_polls=parsed.needle_max_settle_polls,
             )
             env = {**os.environ, "CUDA_VISIBLE_DEVICES": slot["gpu_id"]}
             proc = subprocess.Popen(

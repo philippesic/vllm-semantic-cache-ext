@@ -294,14 +294,35 @@ def _drain_store_counter(
     would misread a genuine ``not_pressured`` run as a ``miss``. Polling
     until the counter is stable across two reads removes that contamination
     (inter-request store activity is bursty-then-quiet, issues log
-    entry #12), without a magic fixed sleep."""
+    entry #12), without a magic fixed sleep.
+
+    Prints a one-line settle report every call -- this is the concrete,
+    checkable signal for issues log entry #77's open grid-concurrency
+    non-determinism question: if exhaustion (the WARNING line) shows up
+    routinely inside a concurrent multi-GPU grid but never in an isolated
+    single-GPU run of the identical config, that is direct evidence host-
+    resource contention (shared CPU/RAM/PCIe bandwidth for CPU-tier offload
+    across concurrently-running cells) is starving the settle window and the
+    fix is to raise `--needle-settle-s`/`--needle-max-settle-polls`; if it
+    settles quickly either way, this mechanism is ruled out and the
+    non-determinism's cause lies elsewhere."""
     prev = snapshot_metrics()
-    for _ in range(max_polls):
+    for i in range(max_polls):
         time.sleep(settle_s)
         cur = snapshot_metrics()
         if cur.get(_STORE_KEY, 0.0) == prev.get(_STORE_KEY, 0.0):
+            print(
+                f"[needle-v2] store-counter settled after {i + 1}/{max_polls} polls",
+                flush=True,
+            )
             return cur
         prev = cur
+    print(
+        f"[needle-v2] WARNING store-counter never settled after {max_polls} "
+        f"polls ({settle_s}s each) -- recall baseline may be contaminated "
+        "by an in-flight distractor store, see issues log entry #77",
+        flush=True,
+    )
     return prev
 
 

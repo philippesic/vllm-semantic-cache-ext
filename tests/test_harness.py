@@ -1014,6 +1014,23 @@ def test_build_slots_single_gpu_reproduces_original_port_and_dir():
     assert slots == [{"gpu_id": "0", "port": 8199, "output_dir": "/tmp/out/gpu0"}]
 
 
+def test_cell_log_path_is_unique_per_policy_and_seed():
+    """Regression: entry #78's `[needle-v2]` diagnostic prints (and any other
+    harness stdout) were captured into a subprocess.PIPE that was only ever
+    read on a cell's failure/timeout -- a successful cell's full output was
+    silently discarded, never written anywhere (issues log entry #82's
+    follow-up). Each cell needs its own real log file, distinct from every
+    other (policy, seed) pair sharing the same slot over time."""
+    from benchmarks.run_grid_sweep import cell_log_path
+
+    a = cell_log_path("/tmp/out/gpu0", "semantic-minmax", 1)
+    b = cell_log_path("/tmp/out/gpu0", "semantic-minmax", 2)
+    c = cell_log_path("/tmp/out/gpu0", "lru", 1)
+
+    assert len({a, b, c}) == 3
+    assert a.startswith("/tmp/out/gpu0/")
+
+
 def test_merge_results_concatenates_all_slots_keeping_one_header(tmp_path):
     from benchmarks.run_grid_sweep import build_slots, merge_results
 

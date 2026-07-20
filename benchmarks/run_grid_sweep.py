@@ -155,6 +155,22 @@ def build_run_latency_suite_args(
     return args
 
 
+def cell_log_path(output_dir: str, policy: str, seed: int) -> str:
+    """Pure, unit-testable: where a (policy, seed) cell's own subprocess
+    stdout/stderr is written.
+
+    Previously each cell's stdout went to a `subprocess.PIPE` that was only
+    ever read on timeout/failure (truncated to the last 1000 chars) -- a
+    successful cell's full output, including any diagnostic prints from
+    inside `run_latency_suite.py`/`harness/*.py` (e.g. needle_workload.py's
+    `_drain_store_counter` settle report, issues log entry #78), was
+    captured into the pipe and then silently discarded, never read or shown
+    anywhere. Writing to a real file (same pattern `harness/server.py`
+    already uses for the `vllm serve` child's own log) makes it inspectable
+    regardless of whether the cell succeeded."""
+    return os.path.join(output_dir, f"cell_{policy}_seed{seed}.log")
+
+
 def build_slots(gpu_ids: list[str], base_port: int, output_dir: str) -> list[dict]:
     """Pure, unit-testable: one slot per GPU -- its pin, its own port (base
     + slot index, so concurrently-running cells on the same node never
@@ -324,9 +340,11 @@ def main():
                 needle_max_settle_polls=parsed.needle_max_settle_polls,
             )
             env = {**os.environ, "CUDA_VISIBLE_DEVICES": slot["gpu_id"]}
+            log_path = cell_log_path(slot["output_dir"], policy, seed)
+            log_file = open(log_path, "w")
             proc = subprocess.Popen(
                 [sys.executable, script_path, *cell_args],
-                stdout=subprocess.PIPE,
+                stdout=log_file,
                 stderr=subprocess.STDOUT,
                 text=True,
                 preexec_fn=os.setsid,
@@ -334,7 +352,8 @@ def main():
             )
             print(
                 f"=== dispatched policy={policy} seed={seed} to "
-                f"gpu={slot['gpu_id']} (slot {slot_idx}, port {slot['port']}) ===",
+                f"gpu={slot['gpu_id']} (slot {slot_idx}, port {slot['port']}) "
+                f"log={log_path} ===",
                 flush=True,
             )
             running[slot_idx] = {
@@ -342,6 +361,8 @@ def main():
                 "start": time.monotonic(),
                 "policy": policy,
                 "seed": seed,
+                "log_file": log_file,
+                "log_path": log_path,
             }
 
         for slot_idx in list(running.keys()):
@@ -353,19 +374,23 @@ def main():
             if retcode is None and not timed_out:
                 continue  # still running, within its budget
 
+            entry["log_file"].close()
+
             if timed_out:
                 _kill_cell(proc, slots[slot_idx]["port"])
-                stdout = proc.stdout.read() if proc.stdout else ""
+                with open(entry["log_path"]) as f:
+                    stdout = f.read()
                 print(
                     f"CELL TIMED OUT policy={entry['policy']} seed={entry['seed']} "
                     f"after {elapsed:.0f}s (limit {parsed.cell_timeout_s:.0f}s) -- "
                     f"likely a stalled request (see vLLM issue #45388); "
-                    f"killed and continuing.",
+                    f"killed and continuing. Log tail: {stdout[-1000:]}",
                     flush=True,
                 )
                 failures.append((entry["policy"], entry["seed"]))
             elif retcode != 0:
-                stdout = proc.stdout.read() if proc.stdout else ""
+                with open(entry["log_path"]) as f:
+                    stdout = f.read()
                 print(
                     f"CELL FAILED policy={entry['policy']} seed={entry['seed']} "
                     f"(exit {retcode}, {elapsed:.0f}s): {stdout[-1000:]}",
@@ -375,7 +400,7 @@ def main():
             else:
                 print(
                     f"cell done policy={entry['policy']} seed={entry['seed']} "
-                    f"({elapsed:.0f}s)",
+                    f"({elapsed:.0f}s) log={entry['log_path']}",
                     flush=True,
                 )
             done += 1

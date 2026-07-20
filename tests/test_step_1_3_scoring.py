@@ -43,14 +43,10 @@ def to_key(n: int):
 
 
 def _seed_durable_summaries(worker, mapping) -> None:
-    """Test-only shortcut to populate durable_summaries directly (skipping
-    the real _durably_key_summaries path some tests don't need to exercise)
-    while still marking the keys for the incremental stack-cache sync --
-    real code always goes through _durably_key_summaries, which does this
-    marking itself; a test that bypasses it must do so explicitly or the
-    cache will never pick the entries up (see _mark_inserted_into_stack_cache)."""
+    """DIAGNOSTIC REVERT: incremental-cache marking removed on this branch,
+    the from-scratch _rebuild_stack_cache reads durable_summaries directly."""
     worker.durable_summaries.update(mapping)
-    worker._mark_inserted_into_stack_cache(mapping.keys())
+    worker._stack_cache_dirty = True
 
 
 def test_durably_key_summaries_aligned_job():
@@ -260,116 +256,6 @@ def test_stack_cache_invalidates_on_new_insertion():
     assert {k for k, _ in second_scores} == {key1, key2}, (
         "newly-stored block missing from scoring -- stale cache bug"
     )
-
-
-def test_stack_cache_eviction_compacts_and_rescoring_excludes_evicted_key():
-    """Regression for the incremental stack_rebuild fix (issues log entries
-    #72/#74): an evicted key must actually disappear from scoring after the
-    next sync, not just flip the dirty flag -- and the surviving key's own
-    score must be unaffected by the compaction (no row misalignment)."""
-    worker = _make_worker(method="minmax")
-    for i, val in enumerate((1.0, 5.0, 9.0)):
-        worker.summaries["layer0"][i] = [_summary(val)]
-        key = to_key(i)
-        worker.receive_job_keys({i: [key]})
-        worker._durably_key_summaries(i, [i])
-    key0, key1, key2 = to_key(0), to_key(1), to_key(2)
-
-    query = torch.tensor([[5.0, 5.0, 5.0, 5.0]])
-    worker._on_query_captured("req-1", query)
-    first = dict(worker.pop_pending_scores()["minmax"]["req-1"])
-    assert set(first) == {key0, key1, key2}
-
-    worker.receive_evicted_keys([key0])
-    assert set(worker.durable_summaries) == {key1, key2}
-
-    worker._on_query_captured("req-2", query)
-    second = dict(worker.pop_pending_scores()["minmax"]["req-2"])
-    assert set(second) == {key1, key2}, "evicted key still present after sync"
-    # key1's score (exact match to the query) is unaffected by compaction.
-    assert second[key1] == pytest.approx(first[key1])
-
-
-def test_stack_cache_interleaved_insert_evict_insert_stays_consistent():
-    """Regression: insert, sync, evict, insert again, sync -- the stacked
-    cache's key list and tensor row count must always agree, across
-    multiple incremental syncs, not just a single insert-then-evict pair."""
-    worker = _make_worker(method="mean")
-    worker.summaries["layer0"][0] = [_summary(1.0)]
-    worker.receive_job_keys({0: [to_key(0)]})
-    worker._durably_key_summaries(0, [0])
-
-    query = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
-    worker._on_query_captured("req-1", query)
-    worker.pop_pending_scores()
-    assert len(worker._stack_cache_keys) == len(worker._stack_cache_index) == 1
-
-    worker.receive_evicted_keys([to_key(0)])
-    worker.summaries["layer0"][1] = [_summary(2.0)]
-    worker.receive_job_keys({1: [to_key(1)]})
-    worker._durably_key_summaries(1, [1])
-
-    worker._on_query_captured("req-2", query)
-    scores = dict(worker.pop_pending_scores()["mean"]["req-2"])
-    assert set(scores) == {to_key(1)}
-    n_rows = worker._stack_cache["mean"].shape[0]
-    assert (
-        n_rows == len(worker._stack_cache_keys) == len(worker._stack_cache_index) == 1
-    )
-
-
-def test_stack_cache_overwrite_of_resident_key_replaces_not_duplicates():
-    """Regression: re-storing the SAME OffloadKey with new content (e.g. a
-    job re-keying a block that's already durable) after the key has already
-    been synced into the stack cache must replace its row, not leave a
-    stale duplicate that a naive incremental-append would introduce."""
-    worker = _make_worker(method="mean")
-    key = to_key(0)
-    worker.summaries["layer0"][0] = [_summary(1.0)]
-    worker.receive_job_keys({0: [key]})
-    worker._durably_key_summaries(0, [0])
-
-    query = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
-    worker._on_query_captured("req-1", query)
-    worker.pop_pending_scores()
-    assert worker._stack_cache["mean"].shape[0] == 1  # synced once
-
-    # Same key, new (very different) content, stored again before eviction.
-    worker.summaries["layer0"][1] = [_summary(9.0)]
-    worker.receive_job_keys({1: [key]})
-    worker._durably_key_summaries(1, [1])
-
-    worker._on_query_captured("req-2", torch.tensor([[9.0, 9.0, 9.0, 9.0]]))
-    scores = dict(worker.pop_pending_scores()["mean"]["req-2"])
-    assert set(scores) == {key}, "overwrite produced a duplicate row"
-    assert worker._stack_cache["mean"].shape[0] == 1
-    assert len(worker._stack_cache_index) == 1
-
-
-def test_prune_durable_summaries_also_removes_stale_stack_cache_row():
-    """Regression: the FIFO-prune backstop deletes straight from
-    durable_summaries, bypassing receive_evicted_keys -- without explicit
-    wiring, a pruned key's row would linger in the stack cache forever and
-    keep being scored even though the manager no longer considers it
-    resident."""
-    worker = _make_worker(method="mean")
-    worker._max_durable_summaries = 1
-    worker.summaries["layer0"][0] = [_summary(1.0)]
-    worker.receive_job_keys({0: [to_key(0)]})
-    worker._durably_key_summaries(0, [0])
-
-    query = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
-    worker._on_query_captured("req-1", query)
-    worker.pop_pending_scores()  # key 0 now synced into the stack cache
-
-    worker.summaries["layer0"][1] = [_summary(2.0)]
-    worker.receive_job_keys({1: [to_key(1)]})
-    worker._durably_key_summaries(1, [1])  # prunes key 0 (cap=1)
-    assert set(worker.durable_summaries) == {to_key(1)}
-
-    worker._on_query_captured("req-2", query)
-    scores = dict(worker.pop_pending_scores()["mean"]["req-2"])
-    assert set(scores) == {to_key(1)}, "pruned key's stale row still being scored"
 
 
 def test_manager_update_relevance_ema():

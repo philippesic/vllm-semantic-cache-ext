@@ -601,6 +601,11 @@ def main():
             needle_num_distractors = resolve_needle_num_distractors(
                 needle_num_prompts, args.needle_num_distractors
             )
+            # The grid's real per-cell seed (entry #84) -- must drive content
+            # generation, not `reference_count` itself, or `--seeds` becomes a
+            # no-op for needle/needle-v2. See needle_case_content_seed's
+            # docstring for why.
+            needle_case_seed_base = args.seed if args.seed is not None else 0
 
             try:
                 for workload in workloads:
@@ -613,7 +618,9 @@ def main():
                                     reference_count=ref_count,
                                     num_distractors=needle_num_distractors,
                                     model=args.model,
-                                    seed=ref_count,
+                                    seed=needle_workload.needle_case_content_seed(
+                                        needle_case_seed_base, ref_count
+                                    ),
                                 )
                                 after = metrics_mod.snapshot(handle.metrics_url())
                                 delta = metrics_mod.diff(before, after)
@@ -676,7 +683,9 @@ def main():
                                     reference_count=ref_count,
                                     num_distractors=needle_num_distractors,
                                     model=args.model,
-                                    seed=ref_count,
+                                    seed=needle_workload.needle_case_content_seed(
+                                        needle_case_seed_base, ref_count
+                                    ),
                                     snapshot_metrics=_snap,
                                     settle_s=args.needle_settle_s,
                                     max_settle_polls=args.needle_max_settle_polls,

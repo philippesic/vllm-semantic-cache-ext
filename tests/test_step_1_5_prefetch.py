@@ -190,21 +190,38 @@ def _make_connector_scheduler(
     sched._pending_splice_jobs = {}
     sched._jobs = {}
     sched._job_counter = 0
-    sched._blocks_being_loaded = set()
-    # gpu_block_size=offloaded_block_size=1 keeps splice-plan tests'
-    # tokens/blocks/keys all in 1:1 correspondence, so a test can build a
-    # request needing N blocks by just handing it N keys and N stub GPU
-    # blocks -- the arithmetic in _compute_load_plan degenerates cleanly.
+    # Same object under both names (pre-#48150 _blocks_being_loaded, renamed
+    # _chunks_being_loaded upstream) -- our own code reads through
+    # scheduler_being_loaded_set (checks _chunks_being_loaded first), real
+    # vLLM code reads whichever name its installed generation declares;
+    # aliasing to one set means either path mutates the same object.
+    sched._blocks_being_loaded = sched._chunks_being_loaded = set()
+    # gpu_block_size/offloaded_block_size=1 (pre-#48150 names) and their
+    # post-#48150 renames tokens_per_block/tokens_per_chunk both set to the
+    # same value keep splice-plan tests' tokens/blocks/keys all in 1:1
+    # correspondence, so a test can build a request needing N blocks by
+    # just handing it N keys and N stub GPU blocks -- the arithmetic in
+    # _compute_load_plan degenerates cleanly. Both name generations are
+    # set (not just whichever the installed vLLM uses) so this stub also
+    # satisfies the REAL inherited base method when a test calls straight
+    # through to super().update_state_after_alloc() (see
+    # test_compute_load_plan_matches_the_real_base_method) -- our own code
+    # reads through the version-tolerant _vllm_compat helpers, but real
+    # vLLM code reads its installed generation's names directly.
     group_config = SimpleNamespace(
         gpu_block_size=1,
         offloaded_block_size=1,
+        tokens_per_block=1,
+        tokens_per_chunk=1,
         hash_block_size_factor=1,
         sliding_window_size_in_blocks=None,
+        sliding_window_size_in_chunks=None,
     )
     sched.config = SimpleNamespace(
         num_workers=1,
         kv_group_configs=tuple(group_config for _ in range(num_groups)),
         block_size_factor=block_size_factor,
+        blocks_per_chunk=block_size_factor,
     )
     return sched
 

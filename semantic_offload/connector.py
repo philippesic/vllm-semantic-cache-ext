@@ -32,9 +32,13 @@ from semantic_offload._debug import ENABLED as _DEBUG_ENABLED
 from semantic_offload._debug import TIMING as _TIMING
 from semantic_offload._debug import debug_print, record_timing
 from semantic_offload._vllm_compat import (
+    config_blocks_per_chunk,
     construct_scheduler_base,
     construct_worker,
     create_offloading_spec,
+    group_config_tokens_per_block,
+    group_config_tokens_per_chunk,
+    scheduler_being_loaded_set,
 )
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
@@ -441,7 +445,7 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         group_state = req_status.group_states[0]
         group_blocks = blocks.blocks[0]
         num_cached_tokens = req_status.num_locally_computed_tokens + num_external_tokens
-        gpu_block_size = group_config.gpu_block_size
+        gpu_block_size = group_config_tokens_per_block(group_config)
         num_gpu_blocks = cdiv(num_cached_tokens, gpu_block_size)
         num_locally_computed_gpu_blocks = num_gpu_blocks
         for i, block in enumerate(group_blocks[:num_gpu_blocks]):
@@ -452,10 +456,10 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         if num_pending_gpu_blocks == 0:
             return None
 
-        offloaded_block_size = group_config.offloaded_block_size
+        offloaded_block_size = group_config_tokens_per_chunk(group_config)
         num_blocks = cdiv(num_cached_tokens, offloaded_block_size)
-        start_block_idx = (
-            num_locally_computed_gpu_blocks // self.config.block_size_factor
+        start_block_idx = num_locally_computed_gpu_blocks // config_blocks_per_chunk(
+            self.config
         )
         keys_to_load = group_state.offload_keys[start_block_idx:num_blocks]
         dst_block_ids = [
@@ -492,7 +496,10 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         requests (and multi-group/sliding-window ones) always fall through
         to the normal path unmodified; their prefetch (if any) is simply
         released as stale by the caller."""
-        if len(self.config.kv_group_configs) != 1 or self.config.block_size_factor != 1:
+        if (
+            len(self.config.kv_group_configs) != 1
+            or config_blocks_per_chunk(self.config) != 1
+        ):
             return False
         prefetch = self._prefetched.get(request.request_id)
         if prefetch is None:
@@ -608,8 +615,9 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
                 keys=set(remainder_keys),
                 is_store=False,
             )
-            if self._blocks_being_loaded is not None:
-                self._blocks_being_loaded.update(remainder_keys)
+            being_loaded = scheduler_being_loaded_set(self)
+            if being_loaded is not None:
+                being_loaded.update(remainder_keys)
 
         # NOTE: no manual manager.complete_load() call here -- checking
         # job_status.pending_count == 0 above already implies

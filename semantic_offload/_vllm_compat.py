@@ -90,6 +90,43 @@ def spec_blocks_per_chunk(spec) -> int:
     return spec.block_size_factor
 
 
+def config_blocks_per_chunk(config) -> int:
+    """SchedulerOffloadConfig's block_size_factor attribute was renamed
+    blocks_per_chunk upstream (#48150), same rename as spec_blocks_per_chunk
+    but on a different object (kv_group_configs itself is unchanged); read
+    whichever exists."""
+    if hasattr(config, "blocks_per_chunk"):
+        return config.blocks_per_chunk
+    return config.block_size_factor
+
+
+def group_config_tokens_per_block(group_config) -> int:
+    """GroupOffloadConfig's gpu_block_size field was renamed
+    tokens_per_block upstream (#48150); read whichever exists."""
+    if hasattr(group_config, "tokens_per_block"):
+        return group_config.tokens_per_block
+    return group_config.gpu_block_size
+
+
+def group_config_tokens_per_chunk(group_config) -> int:
+    """GroupOffloadConfig's offloaded_block_size field was renamed
+    tokens_per_chunk upstream (#48150); read whichever exists."""
+    if hasattr(group_config, "tokens_per_chunk"):
+        return group_config.tokens_per_chunk
+    return group_config.offloaded_block_size
+
+
+def scheduler_being_loaded_set(scheduler):
+    """OffloadingConnectorScheduler's own `_blocks_being_loaded` tracking
+    set (set on self by the base __init__, mutated throughout its
+    lifetime) was renamed `_chunks_being_loaded` upstream (#48150); return
+    whichever attribute exists. Callers mutate the returned set in place
+    (e.g. `.update(...)`), so no corresponding setter is needed."""
+    if hasattr(scheduler, "_chunks_being_loaded"):
+        return scheduler._chunks_being_loaded
+    return scheduler._blocks_being_loaded
+
+
 def init_cpu_offloading_worker_base(
     worker, kv_caches, blocks_per_chunk, num_cpu_blocks
 ):

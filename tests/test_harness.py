@@ -128,6 +128,37 @@ def test_needle_and_probe_and_distractor_share_no_literal_overlap():
     assert code not in distractor
 
 
+def test_needle_case_content_seed_is_deterministic():
+    """Same (case_seed, reference_count) must always produce the same
+    content seed -- a single run and a rerun of the same cell must generate
+    byte-identical needle/probe/distractor content."""
+    a = needle_workload.needle_case_content_seed(3, 1)
+    b = needle_workload.needle_case_content_seed(3, 1)
+    assert a == b
+
+
+def test_needle_case_content_seed_varies_with_case_seed():
+    """Entry #84's bug: binding content generation to `reference_count`
+    alone made the grid's real `--seeds` sweep a complete no-op for needle
+    workloads. Different `case_seed` at the same `reference_count` must now
+    produce different content seeds."""
+    a = needle_workload.needle_case_content_seed(1, 1)
+    b = needle_workload.needle_case_content_seed(2, 1)
+    assert a != b
+
+
+def test_needle_case_content_seed_varies_with_reference_count():
+    """Different `reference_count` values within the same cell/case_seed
+    must not collide onto the same content seed."""
+    seeds = {needle_workload.needle_case_content_seed(5, rc) for rc in range(3)}
+    assert len(seeds) == 3
+
+
+def test_needle_case_content_seed_rejects_reference_count_past_stride_headroom():
+    with pytest.raises(AssertionError):
+        needle_workload.needle_case_content_seed(0, 10)
+
+
 def test_distractor_prompts_are_distinct_across_a_real_case_size():
     """A real needle case calls make_distractor(seed+i) for i in
     range(num_distractors) (up to 25) -- `subject` is drawn from only 5
@@ -789,6 +820,114 @@ def test_resolve_needle_num_distractors_is_independent_of_reference_count():
         # simulates what main() does per ref_count in its loop -- the call
         # itself can't even take reference_count as an input.
         assert resolve_needle_num_distractors(25, None) == 25
+
+
+class _FakeServerHandle:
+    def base_url(self):
+        return "http://fake"
+
+    def metrics_url(self):
+        return "http://fake/metrics"
+
+    def shutdown(self):
+        pass
+
+
+def test_main_binds_needle_and_needle_v2_seed_to_the_real_cli_seed(tmp_path):
+    """Regression guard for issues log entry #84: `main()`'s needle and
+    needle-v2 branches used to pass `seed=ref_count` straight into
+    `run_needle_case`/`run_needle_v2_case`, making the grid's real `--seed`
+    value a complete no-op for content generation. Runs `main()` twice with
+    two different `--seed` values (mocking server launch and the needle
+    workload calls, per this file's own header note that real
+    launch/subprocess orchestration is verified on real hardware, not
+    here) and asserts the `seed=` kwarg actually differs between the two
+    runs, and does NOT simply equal `reference_count` (entry #84's bug)."""
+    from unittest.mock import patch
+
+    from benchmarks import run_latency_suite
+
+    captured_seeds = []
+
+    def fake_run_needle_case(*args, **kwargs):
+        captured_seeds.append(("needle", kwargs["reference_count"], kwargs["seed"]))
+        return {
+            "hit": True,
+            "t_needle_s": 0.0,
+            "t_recall_s": 0.0,
+            "probe_latencies_s": [],
+            "distractor_latencies_s": [],
+        }
+
+    def fake_run_needle_v2_case(*args, **kwargs):
+        captured_seeds.append(("needle-v2", kwargs["reference_count"], kwargs["seed"]))
+        return {
+            "needle_outcome": needle_workload.NEEDLE_HIT,
+            "recall_load_bytes": 0.0,
+            "recall_store_bytes": 0.0,
+            "t_needle_s": 0.0,
+            "t_recall_s": 0.0,
+            "probe_latencies_s": [],
+            "distractor_latencies_s": [],
+        }
+
+    def run_once(seed, output_dir):
+        argv = [
+            "run_latency_suite.py",
+            "--model",
+            "fake-model",
+            "--policies",
+            "lru",
+            "--workloads",
+            "needle,needle-v2",
+            "--num-prompts",
+            "3",
+            "--seed",
+            str(seed),
+            "--output-dir",
+            str(output_dir),
+        ]
+        with (
+            patch.object(sys, "argv", argv),
+            patch.object(
+                run_latency_suite, "launch_server", return_value=_FakeServerHandle()
+            ),
+            patch.object(
+                run_latency_suite.metrics_mod,
+                "snapshot",
+                return_value={
+                    "vllm:kv_offload_load_bytes_total": 0.0,
+                    "vllm:kv_offload_store_bytes_total": 0.0,
+                    "vllm:num_preemptions_total": 0.0,
+                },
+            ),
+            patch.object(
+                run_latency_suite.needle_workload,
+                "run_needle_case",
+                side_effect=fake_run_needle_case,
+            ),
+            patch.object(
+                run_latency_suite.needle_workload,
+                "run_needle_v2_case",
+                side_effect=fake_run_needle_v2_case,
+            ),
+            patch.object(run_latency_suite.time, "sleep"),
+        ):
+            run_latency_suite.main()
+
+    run_once(1, tmp_path / "run1")
+    run1_seeds = list(captured_seeds)
+    captured_seeds.clear()
+    run_once(2, tmp_path / "run2")
+    run2_seeds = list(captured_seeds)
+
+    # 2 workloads (needle, needle-v2) x 3 ref_counts (default 0,1,2) each run.
+    assert len(run1_seeds) == 6
+    assert len(run2_seeds) == 6
+    assert [s[2] for s in run1_seeds] != [s[2] for s in run2_seeds]
+
+    for _workload, reference_count, seed in run1_seeds + run2_seeds:
+        assert seed != reference_count
 
 
 def test_check_existing_schema_accepts_matching_header(tmp_path):

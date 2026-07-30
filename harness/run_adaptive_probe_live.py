@@ -122,7 +122,16 @@ def main() -> int:
         PORT,
         log_dir,
         gpu_memory_utilization=0.5,
-        max_model_len=2048,
+        # Lowered from 2048 alongside num_gpu_blocks_override below: vLLM's
+        # own startup validation requires enough blocks to serve at least
+        # one full max_model_len request, regardless of what real traffic
+        # needs (confirmed 2026-07-29 -- override=60 at max_model_len=2048
+        # failed with "0.05 GiB KV cache is needed, which is larger than
+        # the available KV cache memory (0.03 GiB)"). No real request here
+        # ever approaches 2048 tokens (fillers are ~180-200, needles are
+        # ~50-60), so shrinking the cap to 384 lowers that validation floor
+        # ~5x without touching how many blocks an actual wave demands.
+        max_model_len=384,
         # 200 (the original 2080Ti-tuned value from entries #43/#45/#46)
         # never forces a preemption on a B200: confirmed 2026-07-29, zero
         # "preempt" log lines and zero PARTIAL SPLICE/KEY MISMATCH across
@@ -132,7 +141,9 @@ def main() -> int:
         # comfortably fits an entire wave (~130-140 blocks) even before
         # any complete, so a fast GPU never has to preempt anything. 60
         # blocks fits only ~4-5 full-size requests, forcing contention
-        # within a single wave regardless of how fast decode finishes.
+        # within a single wave regardless of how fast decode finishes --
+        # and, unlike 2048, 384 is a low enough max_model_len that 60
+        # blocks clears the "must fit one full-length request" floor too.
         num_gpu_blocks_override=60,
         kv_transfer_config=kv_transfer_config,
         log_label="adaptive_probe",

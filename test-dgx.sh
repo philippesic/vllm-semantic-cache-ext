@@ -186,6 +186,28 @@ print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available(), '
       "(not needed for text-only serving)"
     uv pip uninstall torchaudio
   fi
+
+  # Same category of bug as torchaudio above: flashinfer (the Python
+  # package) and flashinfer-cubin (its precompiled kernel binaries) can
+  # drift out of sync after an upstream jump pulls in a newer flashinfer
+  # without also refreshing the cubin package. Unlike torchaudio this one
+  # IS needed (it's vllm's attention backend on CUDA), so the fix is to
+  # align versions, not uninstall -- pin cubin to whatever flashinfer's
+  # error message says it wants.
+  flashinfer_err=$(python -c "import flashinfer" 2>&1 1>/dev/null)
+  if echo "$flashinfer_err" | grep -q "does not match flashinfer version"; then
+    target_ver=$(echo "$flashinfer_err" |
+      sed -n 's/.*does not match flashinfer version (\([^)]*\)).*/\1/p')
+    if [ -n "$target_ver" ]; then
+      echo "flashinfer/flashinfer-cubin version mismatch -- pinning" \
+        "flashinfer-cubin to $target_ver"
+      uv pip install "flashinfer-cubin==$target_ver"
+    else
+      echo "flashinfer/flashinfer-cubin version mismatch detected but" \
+        "couldn't parse the target version -- fix manually:"
+      echo "$flashinfer_err"
+    fi
+  fi
 }
 
 opt_2_unit_tests() {

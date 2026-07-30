@@ -51,10 +51,9 @@ _run() {
 }
 
 _require_free_gpu() {
-  # Fail fast with a clear diagnostic instead of launching vllm serve and
-  # hitting a buried CUDA-OOM error N minutes into a run. Not automatic --
-  # option 0 is the only thing that kills anything, and only when you run
-  # it yourself.
+  # Used by opt_6 (grid sweep), which manages its own per-slot
+  # CUDA_VISIBLE_DEVICES across $GPUS internally -- just checks that at
+  # least one GPU in the box has room before dispatching cells.
   local min_free_mib="${1:-40000}"
   local best
   best=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | sort -rn | head -1)
@@ -65,6 +64,30 @@ _require_free_gpu() {
       "right now, or free a GPU yourself, then re-run."
     return 1
   fi
+}
+
+_pick_free_gpu() {
+  # opt_3/opt_4 launch a single vllm serve with no CUDA_VISIBLE_DEVICES of
+  # their own, which means it always lands on device 0 -- so checking "is
+  # SOME GPU free" isn't enough, device 0 specifically can be OOM while
+  # every other GPU is idle (exactly what happened: 13/178 GiB free on
+  # cuda:0 after everything else was killed). Pick the actual GPU with the
+  # most free memory and print its index on stdout so callers can pin
+  # CUDA_VISIBLE_DEVICES to it, instead of gambling on device 0.
+  local min_free_mib="${1:-40000}"
+  local idx free
+  read -r idx free < <(
+    nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null |
+      awk -F', *' '{print $1, $2}' | sort -k2 -rn | head -1
+  )
+  if [ -z "$free" ] || [ "$free" -lt "$min_free_mib" ]; then
+    echo "No GPU with >= ${min_free_mib} MiB free (best: GPU ${idx:-?} with ${free:-0} MiB)." >&2
+    nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv >&2
+    echo "Run option 0 to kill stray 'vllm serve' processes if that's safe" \
+      "right now, or free a GPU yourself, then re-run." >&2
+    return 1
+  fi
+  echo "$idx"
 }
 
 opt_0_kill_stale() {
@@ -142,8 +165,10 @@ opt_2_unit_tests() {
 opt_3_latency_smoke() {
   # Small-dev-model validation run, per benchmarks/run_latency_suite.py's
   # own documented smoke usage. Real server, ~a few minutes.
-  _require_free_gpu || return 1
-  python benchmarks/run_latency_suite.py \
+  local gpu_idx
+  gpu_idx=$(_pick_free_gpu) || return 1
+  echo "Using GPU $gpu_idx (most free memory right now)"
+  CUDA_VISIBLE_DEVICES="$gpu_idx" python benchmarks/run_latency_suite.py \
       --model "$MODEL" \
       --policies lru,arc,semantic-minmax,semantic-mean \
       --workloads chat \
@@ -159,8 +184,10 @@ opt_4_splice_probe() {
   # content is correct. Watches the server's own debug log live and fires
   # the recall the instant a real PARTIAL SPLICE references the tagged
   # needle request. Real server, real 40-filler contention, ~a few minutes.
-  _require_free_gpu || return 1
-  SEMANTIC_OFFLOAD_DEBUG=1 python harness/run_adaptive_probe_live.py
+  local gpu_idx
+  gpu_idx=$(_pick_free_gpu) || return 1
+  echo "Using GPU $gpu_idx (most free memory right now)"
+  CUDA_VISIBLE_DEVICES="$gpu_idx" SEMANTIC_OFFLOAD_DEBUG=1 python harness/run_adaptive_probe_live.py
 }
 
 opt_5_recall_cost_experiments() {

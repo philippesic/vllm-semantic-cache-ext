@@ -227,12 +227,30 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
             return
         self._preempted_pending.add(request.request_id)
 
+    def _queue_preempted(self, scheduler_output: SchedulerOutput) -> None:
+        """vLLM removed the scheduler-side on_request_preempted hook this
+        class used to override (confirmed absent from the whole vllm/ tree
+        as of 2026-07-29 -- it was replaced by SchedulerOutput's own
+        preempted_req_ids field plus a worker-side handle_preemptions
+        callback that this connector doesn't need). Preemptions are now
+        only observable from inside build_connector_meta via
+        scheduler_output.preempted_req_ids, so this is called from there
+        instead, first thing, to keep on_request_preempted's original
+        contract: queue only, never reserve synchronously here (same
+        crash risk its docstring describes -- _retry_pending_prefetches
+        still excludes this step's preempted_req_ids from the attempt
+        list, so timing is unchanged from when the hook fired)."""
+        if _DISABLE_PREFETCH:
+            return
+        self._preempted_pending.update(scheduler_output.preempted_req_ids or ())
+
     def _retry_pending_prefetches(self, scheduler_output: SchedulerOutput) -> None:
         """Called every scheduling step (from build_connector_meta), for
-        every request queued by on_request_preempted or a previously-failed
-        retry. Requests preempted THIS SAME step are skipped (see
-        on_request_preempted's docstring) -- by the next step they're no
-        longer in `scheduler_output.preempted_req_ids`, and
+        every request queued by _queue_preempted (or on_request_preempted,
+        no longer called by vLLM but kept for its own unit tests) or a
+        previously-failed retry. Requests preempted THIS SAME step are
+        skipped (see on_request_preempted's docstring) -- by the next step
+        they're no longer in `scheduler_output.preempted_req_ids`, and
         get_num_new_matched_tokens's existing "defer while transfer_jobs is
         non-empty" guard (offloading/scheduler.py ~line 718) prevents them
         from being re-preempted while a prefetch job is pending, so a
@@ -673,13 +691,15 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
-        # Must run BEFORE super().build_connector_meta(), which reads and
+        # _queue_preempted must run before _retry_pending_prefetches, both
+        # before super().build_connector_meta(): the latter reads and
         # resets self._current_batch_load_jobs -- a job a retry adds this
         # step needs to already be in that dict when the base class
         # consumes it, not after. Needs scheduler_output itself (not just
         # its eventual effects) to know which requests were preempted THIS
         # step -- see on_request_preempted's docstring for why those must
         # be skipped here.
+        self._queue_preempted(scheduler_output)
         self._retry_pending_prefetches(scheduler_output)
         base_meta = super().build_connector_meta(scheduler_output)
         assert isinstance(base_meta, OffloadingConnectorMetadata)

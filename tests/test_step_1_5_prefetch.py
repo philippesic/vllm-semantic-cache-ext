@@ -401,6 +401,43 @@ def test_on_request_preempted_is_noop_when_prefetch_disabled():
     assert sched._preempted_pending == set()
 
 
+def test_queue_preempted_seeds_pending_from_scheduler_output():
+    """vLLM removed the on_request_preempted scheduler hook this class used
+    to override (confirmed absent from the whole vllm/ tree as of
+    2026-07-29 -- replaced by SchedulerOutput.preempted_req_ids, read from
+    build_connector_meta instead). _queue_preempted is the replacement
+    trigger; same queue-only contract as on_request_preempted above."""
+    manager = SemanticOffloadingManager(num_blocks=10)
+    key = to_key(1)
+    _insert_resident(manager, key, block_id=0)
+    manager.relevance_ema.setdefault("minmax", {})[key] = 1.0
+    sched = _make_connector_scheduler(manager, _StubBlockPool(20, free_blocks=0))
+    _add_req_status(sched, "r1", keys=[key])
+
+    sched._queue_preempted(SimpleNamespace(preempted_req_ids={"r1"}))
+
+    assert "r1" in sched._preempted_pending
+    assert "r1" not in sched._prefetched
+
+
+def test_queue_preempted_is_noop_when_prefetch_disabled():
+    from unittest.mock import patch
+
+    import semantic_offload.connector as connector_mod
+
+    manager = SemanticOffloadingManager(num_blocks=10)
+    key = to_key(1)
+    _insert_resident(manager, key, block_id=0)
+    manager.relevance_ema.setdefault("minmax", {})[key] = 1.0
+    sched = _make_connector_scheduler(manager, _StubBlockPool(20, free_blocks=5))
+    _add_req_status(sched, "r1", keys=[key])
+
+    with patch.object(connector_mod, "_DISABLE_PREFETCH", True):
+        sched._queue_preempted(SimpleNamespace(preempted_req_ids={"r1"}))
+
+    assert sched._preempted_pending == set()
+
+
 def test_retry_pending_prefetches_skips_requests_preempted_this_step():
     """issues log entry #27 (Fix B): a request preempted THIS scheduling
     step must not be attempted even during the retry sweep -- it only

@@ -50,6 +50,53 @@ _run() {
   return "$status"
 }
 
+_require_free_gpu() {
+  # Fail fast with a clear diagnostic instead of launching vllm serve and
+  # hitting a buried CUDA-OOM error N minutes into a run. Not automatic --
+  # option 0 is the only thing that kills anything, and only when you run
+  # it yourself.
+  local min_free_mib="${1:-40000}"
+  local best
+  best=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | sort -rn | head -1)
+  if [ -z "$best" ] || [ "$best" -lt "$min_free_mib" ]; then
+    echo "No GPU with >= ${min_free_mib} MiB free (best available: ${best:-none} MiB)."
+    nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv
+    echo "Run option 0 to kill stray 'vllm serve' processes if that's safe" \
+      "right now, or free a GPU yourself, then re-run."
+    return 1
+  fi
+}
+
+opt_0_kill_stale() {
+  # Explicit only -- never part of 'all'. Kills every 'vllm serve' process
+  # group on this box. Confirm nothing else needs those GPUs before running.
+  local pids
+  pids=$(pgrep -f "vllm serve" || true)
+  if [ -z "$pids" ]; then
+    echo "No 'vllm serve' processes found."
+    return 0
+  fi
+  echo "Found:"
+  ps -o pid,ppid,pgid,cmd -p $pids
+  echo "Sending SIGTERM to each process group..."
+  for pid in $pids; do
+    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+    [ -n "$pgid" ] && kill -TERM "-$pgid" 2>/dev/null || true
+  done
+  sleep 5
+  pids=$(pgrep -f "vllm serve" || true)
+  if [ -n "$pids" ]; then
+    echo "Still alive, sending SIGKILL: $pids"
+    for pid in $pids; do
+      pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+      [ -n "$pgid" ] && kill -KILL "-$pgid" 2>/dev/null || true
+    done
+    sleep 3
+  fi
+  echo "GPU memory after cleanup:"
+  nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv
+}
+
 opt_1_sanity() {
   nvidia-smi
   echo
@@ -95,6 +142,7 @@ opt_2_unit_tests() {
 opt_3_latency_smoke() {
   # Small-dev-model validation run, per benchmarks/run_latency_suite.py's
   # own documented smoke usage. Real server, ~a few minutes.
+  _require_free_gpu || return 1
   python benchmarks/run_latency_suite.py \
       --model "$MODEL" \
       --policies lru,arc,semantic-minmax,semantic-mean \
@@ -111,6 +159,7 @@ opt_4_splice_probe() {
   # content is correct. Watches the server's own debug log live and fires
   # the recall the instant a real PARTIAL SPLICE references the tagged
   # needle request. Real server, real 40-filler contention, ~a few minutes.
+  _require_free_gpu || return 1
   SEMANTIC_OFFLOAD_DEBUG=1 python harness/run_adaptive_probe_live.py
 }
 
@@ -143,6 +192,7 @@ opt_6_grid_sweep() {
   # target-duration-s 600 per cell x policies x workloads x rates x seeds).
   # Uses every GPU in $GPUS concurrently (auto-detected via nvidia-smi,
   # override with GPUS=0,1,... env var).
+  _require_free_gpu || return 1
   python benchmarks/run_grid_sweep.py \
       --model "$MODEL" \
       --policies lru,arc,semantic-minmax,semantic-mean \
@@ -157,6 +207,7 @@ opt_6_grid_sweep() {
 }
 
 declare -A NAMES=(
+  [0]="0_kill_stale"
   [1]="1_sanity"
   [2]="2_unit_tests"
   [3]="3_latency_smoke"
@@ -165,6 +216,7 @@ declare -A NAMES=(
   [6]="6_grid_sweep"
 )
 declare -A DESCRIPTIONS=(
+  [0]="Kill stray 'vllm serve' processes and free GPU memory. EXPLICIT ONLY -- never runs as part of 'all'."
   [1]="Sanity check -- nvidia-smi, torch/CUDA, vllm, semantic_offload import (installs if missing). Seconds."
   [2]="Unit tests -- pytest tests/. CPU-only logic but good to confirm green on this box too. Seconds."
   [3]="Latency suite smoke -- real vllm server, lru/arc/semantic-minmax/semantic-mean, chat workload, 20 prompts. ~Minutes."
@@ -175,22 +227,24 @@ declare -A DESCRIPTIONS=(
 
 run_option() {
   case "$1" in
+    0) _run "${NAMES[0]}" opt_0_kill_stale ;;
     1) _run "${NAMES[1]}" opt_1_sanity ;;
     2) _run "${NAMES[2]}" opt_2_unit_tests ;;
     3) _run "${NAMES[3]}" opt_3_latency_smoke ;;
     4) _run "${NAMES[4]}" opt_4_splice_probe ;;
     5) _run "${NAMES[5]}" opt_5_recall_cost_experiments ;;
     6) _run "${NAMES[6]}" opt_6_grid_sweep ;;
-    *) echo "Unknown option: $1 (valid: 1-6, all)"; return 1 ;;
+    *) echo "Unknown option: $1 (valid: 0-6, all)"; return 1 ;;
   esac
 }
 
 print_menu() {
   echo "GPUS detected/selected: $GPUS   MODEL: $MODEL"
   echo
-  for i in 1 2 3 4 5 6; do
+  for i in 0 1 2 3 4 5 6; do
     echo "  $i) ${DESCRIPTIONS[$i]}"
   done
+  echo "('all' runs 1-6 only -- option 0 always requires being typed explicitly)"
   echo
 }
 

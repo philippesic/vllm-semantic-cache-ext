@@ -65,6 +65,27 @@ print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available(), '
   else
     echo "semantic_offload importable OK"
   fi
+
+  if ! python -m pytest --version >/dev/null 2>&1; then
+    echo "pytest not installed -- installing"
+    uv pip install pytest
+  else
+    echo "pytest importable OK"
+  fi
+
+  # transformers imports torchaudio transitively (audio-model support this
+  # text-only project doesn't use). transformers guards a *missing*
+  # torchaudio, but torchaudio raises RuntimeError (not ImportError) when
+  # its CUDA build doesn't match torch's -- that's uncaught and crashes
+  # every real-server launch. Uninstalling it is the actual fix, not
+  # reinstalling a matching build (may not exist yet for a brand-new torch
+  # CUDA tag, see the wheel-lag issue sync-vllm-upstream.sh works around).
+  torchaudio_err=$(python -c "import torchaudio" 2>&1 1>/dev/null)
+  if echo "$torchaudio_err" | grep -q "different CUDA versions"; then
+    echo "torchaudio/torch CUDA mismatch detected -- uninstalling torchaudio" \
+      "(not needed for text-only serving)"
+    uv pip uninstall torchaudio
+  fi
 }
 
 opt_2_unit_tests() {

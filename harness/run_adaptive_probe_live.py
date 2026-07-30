@@ -6,7 +6,9 @@ by any problem with the probe tool itself, which was already unit-tested).
 
 Reuses the known-working splice-forcing load shape from entries #43/#45/#46
 (1 long-ish target request concurrent with 40 padded ~140-token fillers
-across 4 staggered waves, `--num-gpu-blocks-override 200`) -- except the
+across 4 staggered waves; originally `--num-gpu-blocks-override 200`,
+tightened to 60 on 2026-07-29 -- 200 never forces a preemption on a B200,
+see the comment at the launch_server call) -- except the
 "target" here IS the adaptive probe's own tagged needle request, so instead
 of hoping a fixed-schedule recall happens to land after a real splice
 (which is what entries #33/#41/#43/#45 kept missing by chance), the probe
@@ -121,7 +123,17 @@ def main() -> int:
         log_dir,
         gpu_memory_utilization=0.5,
         max_model_len=2048,
-        num_gpu_blocks_override=200,
+        # 200 (the original 2080Ti-tuned value from entries #43/#45/#46)
+        # never forces a preemption on a B200: confirmed 2026-07-29, zero
+        # "preempt" log lines and zero PARTIAL SPLICE/KEY MISMATCH across
+        # 3 consecutive runs. Each filler is ~180-200 tokens (~12-13
+        # blocks at block_size=16), and a wave's ~10-11 requests land
+        # near-simultaneously via the ThreadPoolExecutor -- 200 blocks
+        # comfortably fits an entire wave (~130-140 blocks) even before
+        # any complete, so a fast GPU never has to preempt anything. 60
+        # blocks fits only ~4-5 full-size requests, forcing contention
+        # within a single wave regardless of how fast decode finishes.
+        num_gpu_blocks_override=60,
         kv_transfer_config=kv_transfer_config,
         log_label="adaptive_probe",
     )

@@ -5,10 +5,12 @@ validation attempts were interrupted by a stuck fork before completing, not
 by any problem with the probe tool itself, which was already unit-tested).
 
 Reuses the known-working splice-forcing load shape from entries #43/#45/#46
-(1 long-ish target request concurrent with 40 padded ~140-token fillers
-across 4 staggered waves; originally `--num-gpu-blocks-override 200`,
-tightened to 60 on 2026-07-29 -- 200 never forces a preemption on a B200,
-see the comment at the launch_server call) -- except the
+(1 long-ish target request concurrent with 40 padded fillers across 4
+staggered waves), re-tuned for B200-class hardware on 2026-07-29: the
+original `--num-gpu-blocks-override 200` / 140-token fillers never forced
+a single preemption (a 2080Ti-tuned shape a much faster GPU just runs
+through); now 40 blocks / 400-token fillers, see the comments at the
+launch_server call -- except the
 "target" here IS the adaptive probe's own tagged needle request, so instead
 of hoping a fixed-schedule recall happens to land after a real splice
 (which is what entries #33/#41/#43/#45 kept missing by chance), the probe
@@ -122,29 +124,29 @@ def main() -> int:
         PORT,
         log_dir,
         gpu_memory_utilization=0.5,
-        # Lowered from 2048 alongside num_gpu_blocks_override below: vLLM's
-        # own startup validation requires enough blocks to serve at least
-        # one full max_model_len request, regardless of what real traffic
-        # needs (confirmed 2026-07-29 -- override=60 at max_model_len=2048
-        # failed with "0.05 GiB KV cache is needed, which is larger than
-        # the available KV cache memory (0.03 GiB)"). No real request here
-        # ever approaches 2048 tokens (fillers are ~180-200, needles are
-        # ~50-60), so shrinking the cap to 384 lowers that validation floor
-        # ~5x without touching how many blocks an actual wave demands.
-        max_model_len=384,
+        # Raised to 512 (from 384, itself lowered from 2048) to give the
+        # now-longer filler generations (400 tokens, see below) headroom:
+        # prompt (~40) + 400 generated ~= 440, needs margin under the cap.
+        # vLLM's startup validation requires enough blocks to serve one
+        # full max_model_len request regardless of real traffic, so this
+        # also sets the floor for num_gpu_blocks_override below (512/16
+        # = 32 blocks minimum at the default block_size).
+        max_model_len=512,
         # 200 (the original 2080Ti-tuned value from entries #43/#45/#46)
-        # never forces a preemption on a B200: confirmed 2026-07-29, zero
-        # "preempt" log lines and zero PARTIAL SPLICE/KEY MISMATCH across
-        # 3 consecutive runs. Each filler is ~180-200 tokens (~12-13
-        # blocks at block_size=16), and a wave's ~10-11 requests land
-        # near-simultaneously via the ThreadPoolExecutor -- 200 blocks
-        # comfortably fits an entire wave (~130-140 blocks) even before
-        # any complete, so a fast GPU never has to preempt anything. 60
-        # blocks fits only ~4-5 full-size requests, forcing contention
-        # within a single wave regardless of how fast decode finishes --
-        # and, unlike 2048, 384 is a low enough max_model_len that 60
-        # blocks clears the "must fit one full-length request" floor too.
-        num_gpu_blocks_override=60,
+        # never forces a preemption on a B200 (confirmed 2026-07-29: zero
+        # preempt/PARTIAL SPLICE/KEY MISMATCH). 60 alone didn't fix it
+        # either -- two more runs at 60/384 still saw zero of all three,
+        # even though 11 near-simultaneous ~190-token fillers per wave
+        # (~130-140 blocks needed) should exceed a 60-block budget. Most
+        # likely cause: a 1.5B model decodes fast enough on a B200 that
+        # requests don't stay resident long enough to truly overlap,
+        # regardless of admission timing -- addressed by tripling filler
+        # length above, not just shrinking the block budget further. 40
+        # keeps a comfortable margin above the new 32-block floor (one
+        # full 512-token request) while still fitting only ~1-2 fillers
+        # at their now-much-larger peak footprint (~27-28 blocks each
+        # near the end of a 400-token generation).
+        num_gpu_blocks_override=40,
         kv_transfer_config=kv_transfer_config,
         log_label="adaptive_probe",
     )
@@ -190,7 +192,17 @@ def main() -> int:
                         ex.submit(
                             _post,
                             _make_filler_prompt(wave, i),
-                            140,
+                            # Raised from 140: even at a 60-block budget,
+                            # two straight B200 runs saw zero preemptions
+                            # and zero PARTIAL SPLICE/KEY MISMATCH (2026-
+                            # 07-29) -- a 1.5B model decodes 140 tokens on
+                            # a B200 fast enough that near-simultaneous
+                            # admission doesn't reliably produce actual
+                            # overlapping residency, independent of the
+                            # block budget. 400 tokens keeps each filler
+                            # resident ~3x longer, making overlap far more
+                            # likely regardless of admission-timing jitter.
+                            400,
                             handle.base_url(),
                         )
                     )

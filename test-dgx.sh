@@ -90,34 +90,64 @@ _pick_free_gpu() {
   echo "$idx"
 }
 
-opt_0_kill_stale() {
-  # Explicit only -- never part of 'all'. Kills every 'vllm serve' process
-  # group on this box. Confirm nothing else needs those GPUs before running.
+_vllm_pids() {
+  # Two independent detection paths, unioned, since a stray process might
+  # match only one: (1) cmdline pattern for vllm's own process names/
+  # titles (VLLM::Worker_* etc. are setproctitle'd, so they show up in
+  # `ps`'s COMMAND column even though argv never says "vllm serve"
+  # literally); (2) whatever nvidia-smi itself reports as attached to a
+  # GPU, filtered down to ones whose cmdline mentions vllm -- catches
+  # anything launched in a way (2) doesn't have a name for, without
+  # sweeping up an unrelated CUDA job that happens to share the box.
+  local by_pattern by_gpu p cmd
+  by_pattern=$(pgrep -f "vllm serve|VLLM::|EngineCore|vllm\.entrypoints" 2>/dev/null || true)
+  by_gpu=""
+  for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' '); do
+    cmd=$(ps -o cmd= -p "$p" 2>/dev/null || true)
+    if echo "$cmd" | grep -qi vllm; then
+      by_gpu="$by_gpu $p"
+    fi
+  done
+  printf '%s\n%s\n' "$by_pattern" "$by_gpu" | grep -E '^[0-9]+$' | sort -u
+}
+
+_kill_vllm_processes() {
   local pids
-  pids=$(pgrep -f "vllm serve" || true)
+  pids=$(_vllm_pids)
   if [ -z "$pids" ]; then
-    echo "No 'vllm serve' processes found."
+    echo "No vllm-related processes found."
     return 0
   fi
   echo "Found:"
-  ps -o pid,ppid,pgid,cmd -p $pids
+  ps -o pid,ppid,pgid,cmd -p "$(echo "$pids" | tr '\n' ',' | sed 's/,$//')" 2>/dev/null || true
   echo "Sending SIGTERM to each process group..."
+  local pid pgid
   for pid in $pids; do
     pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
-    [ -n "$pgid" ] && kill -TERM "-$pgid" 2>/dev/null || true
+    if [ -n "$pgid" ]; then kill -TERM "-$pgid" 2>/dev/null || true
+    else kill -TERM "$pid" 2>/dev/null || true; fi
   done
   sleep 5
-  pids=$(pgrep -f "vllm serve" || true)
+  pids=$(_vllm_pids)
   if [ -n "$pids" ]; then
-    echo "Still alive, sending SIGKILL: $pids"
+    echo "Still alive, sending SIGKILL:"
+    echo "$pids"
     for pid in $pids; do
       pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
-      [ -n "$pgid" ] && kill -KILL "-$pgid" 2>/dev/null || true
+      if [ -n "$pgid" ]; then kill -KILL "-$pgid" 2>/dev/null || true
+      else kill -KILL "$pid" 2>/dev/null || true; fi
     done
     sleep 3
   fi
   echo "GPU memory after cleanup:"
   nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv
+}
+
+opt_0_kill_stale() {
+  # Explicit only -- never part of 'all'. Confirm nothing else needs those
+  # GPUs before running (opt_3/4/6 also call this before and after
+  # themselves automatically -- this is for a manual box-wide cleanup).
+  _kill_vllm_processes
 }
 
 opt_1_sanity() {
@@ -165,7 +195,9 @@ opt_2_unit_tests() {
 opt_3_latency_smoke() {
   # Small-dev-model validation run, per benchmarks/run_latency_suite.py's
   # own documented smoke usage. Real server, ~a few minutes.
-  local gpu_idx
+  echo "Pre-run cleanup (stray vllm processes from earlier/crashed runs)..."
+  _kill_vllm_processes
+  local gpu_idx rc
   gpu_idx=$(_pick_free_gpu) || return 1
   echo "Using GPU $gpu_idx (most free memory right now)"
   CUDA_VISIBLE_DEVICES="$gpu_idx" python benchmarks/run_latency_suite.py \
@@ -177,6 +209,10 @@ opt_3_latency_smoke() {
       --scale 0.05 \
       --cpu-bytes-to-use 268435456 \
       --output-dir /tmp/latency_suite_smoke
+  rc=$?
+  echo "Post-run cleanup..."
+  _kill_vllm_processes
+  return "$rc"
 }
 
 opt_4_splice_probe() {
@@ -184,10 +220,16 @@ opt_4_splice_probe() {
   # content is correct. Watches the server's own debug log live and fires
   # the recall the instant a real PARTIAL SPLICE references the tagged
   # needle request. Real server, real 40-filler contention, ~a few minutes.
-  local gpu_idx
+  echo "Pre-run cleanup (stray vllm processes from earlier/crashed runs)..."
+  _kill_vllm_processes
+  local gpu_idx rc
   gpu_idx=$(_pick_free_gpu) || return 1
   echo "Using GPU $gpu_idx (most free memory right now)"
   CUDA_VISIBLE_DEVICES="$gpu_idx" SEMANTIC_OFFLOAD_DEBUG=1 python harness/run_adaptive_probe_live.py
+  rc=$?
+  echo "Post-run cleanup..."
+  _kill_vllm_processes
+  return "$rc"
 }
 
 opt_5_recall_cost_experiments() {
@@ -219,7 +261,10 @@ opt_6_grid_sweep() {
   # target-duration-s 600 per cell x policies x workloads x rates x seeds).
   # Uses every GPU in $GPUS concurrently (auto-detected via nvidia-smi,
   # override with GPUS=0,1,... env var).
+  echo "Pre-run cleanup (stray vllm processes from earlier/crashed runs)..."
+  _kill_vllm_processes
   _require_free_gpu || return 1
+  local rc
   python benchmarks/run_grid_sweep.py \
       --model "$MODEL" \
       --policies lru,arc,semantic-minmax,semantic-mean \
@@ -231,6 +276,10 @@ opt_6_grid_sweep() {
       --needle-reference-counts 0,1,2 \
       --output-dir "results/step_1_6_first_pass_$(date +%Y%m%d_%H%M%S)" \
       --gpus "$GPUS"
+  rc=$?
+  echo "Post-run cleanup..."
+  _kill_vllm_processes
+  return "$rc"
 }
 
 declare -A NAMES=(
@@ -243,7 +292,7 @@ declare -A NAMES=(
   [6]="6_grid_sweep"
 )
 declare -A DESCRIPTIONS=(
-  [0]="Kill stray 'vllm serve' processes and free GPU memory. EXPLICIT ONLY -- never runs as part of 'all'."
+  [0]="Kill stray vllm processes and free GPU memory (manual, box-wide). 3/4/6 already do this before+after themselves -- use this for a standalone cleanup. EXPLICIT ONLY -- never runs as part of 'all'."
   [1]="Sanity check -- nvidia-smi, torch/CUDA, vllm, semantic_offload import (installs if missing). Seconds."
   [2]="Unit tests -- pytest tests/. CPU-only logic but good to confirm green on this box too. Seconds."
   [3]="Latency suite smoke -- real vllm server, lru/arc/semantic-minmax/semantic-mean, chat workload, 20 prompts. ~Minutes."

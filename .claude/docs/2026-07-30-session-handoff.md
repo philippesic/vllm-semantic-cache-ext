@@ -132,9 +132,11 @@ first whether the prefetch-admission-backpressure path in `connector.py`
 (described below) is now actually engaging and misbehaving under this much
 higher preemption volume, before assuming a different mechanism.
 `2.6-result.csv` at the ext repo root still holds the *first*-pass data;
-the second-pass CSV lives only on the DGX at
-`results/step_1_6_second_pass_20260730_193645/results.csv` and was not
-copied into this repo this session.
+the second-pass CSV (216 rows, from
+`results/step_1_6_second_pass_20260730_193645/results.csv` on the DGX) has
+now been copied to `2.6-second-pass-result.csv` at the ext repo root,
+untracked, matching how the first-pass file is kept (not committed —
+`results/` itself is gitignored and this follows the same spirit).
 
 ## What's still open
 
@@ -236,7 +238,6 @@ writing any new code.
   policy/workload/rate combo before changing any config or code — don't
   retune workload parameters as a first move, the same lesson from the
   2026-07-29 preemption-bug debugging applies here too.
-- Copy `results/step_1_6_second_pass_20260730_193645/results.csv` off the
-  DGX before that directory is cleaned up — it currently exists only there,
-  not in this repo. `2.6-result.csv` at the repo root is stale first-pass
-  data.
+- `2.6-second-pass-result.csv` at the repo root now holds the second-pass
+  data (216 rows); `2.6-result.csv` is the stale first-pass data. Both are
+  untracked working copies, not committed.

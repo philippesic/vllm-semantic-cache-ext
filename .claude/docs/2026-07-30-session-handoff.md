@@ -138,6 +138,112 @@ now been copied to `2.6-second-pass-result.csv` at the ext repo root,
 untracked, matching how the first-pass file is kept (not committed —
 `results/` itself is gitignored and this follows the same spirit).
 
+## Update 2 (same day): `semantic-minmax`/`rag@8.0` timing breakdown — a strong, code-level lead
+
+Reproduced the hang standalone (outside the grid sweep, isolated
+policy/workload/rate/seed) with `SEMANTIC_OFFLOAD_TIMING=1`:
+
+```
+CUDA_VISIBLE_DEVICES=<free GPU> SEMANTIC_OFFLOAD_TIMING=1 python \
+  benchmarks/run_latency_suite.py --model Qwen/Qwen2.5-1.5B-Instruct \
+  --policies semantic-minmax --workloads rag --request-rates 8.0 \
+  --needle-reference-counts 0,1,2 --scale 0.08 --cpu-bytes-to-use 2147483648 \
+  --max-model-len 4096 --num-gpu-blocks-override 320 --seed 1 \
+  --target-duration-s 600 --output-dir results/timing_repro_minmax_rag8
+```
+
+**Reproduced again** — `preemptions_delta=1113` this time (higher than any
+of the 3 sweep seeds' 333-777), full 1800s timeout. 4/4 reproductions
+across this session (3 sweep seeds + this standalone run); this is
+deterministic under this config, not flaky.
+
+One gotcha worth recording: `SEMANTIC_OFFLOAD_TIMING`'s output doesn't
+appear in the client's terminal/log — `harness/server.py`'s `launch_server()`
+redirects the `vllm serve` subprocess's stdout/stderr straight to a
+per-run server log file
+(`results/<output-dir>/server_<policy>_<port>_<timestamp>.log`), so
+`record_timing()`'s prints (which happen inside that server process) only
+show up there. `grep SEMANTIC_TIMING` on that file, not the client output.
+
+**The timing breakdown itself is a real, quantified lead — not flat
+per-call cost, but a **climbing** per-call cost** across the run, in every
+instrumented bucket (`worker.py`'s `_on_queries_captured`, all tagged
+`(EngineCore pid=...)` — this vLLM config runs the worker code in the
+EngineCore process, not a separate worker subprocess). Comparing the
+*marginal* cost of calls 2001-4000 against calls 1-2000 (each bucket's
+`record_timing()` prints a cumulative summary every 2000 calls, so the
+second print's total minus the first's isolates that window):
+
+| bucket | calls 1-2000 (mean) | calls 2001-4000 (mean) | growth |
+|---|---|---|---|
+| `query_captured_sync` | 0.19 ms | 0.34 ms | 1.8x |
+| `query_captured_total` | 8.95 ms | 20.73 ms | 2.3x |
+| `update_relevance` | 1.88 ms | 4.48 ms | 2.4x |
+| `stack_rebuild` | 0.11 ms | 0.67 ms | **6.0x** |
+
+Every bucket got more expensive per call within the *same run* — the
+signature of cost scaling with a growing accumulator, not a flat
+per-request cost.
+
+**Code-level candidate found in `worker.py`'s `_rebuild_stack_cache()`
+(lines 234-289):** the docstring/comment (lines 235-244) describes it as
+incremental — "compact out pending removals... instead of a from-scratch
+rebuild over EVERY resident candidate" — but the removal branch doesn't
+actually deliver that:
+
+```python
+if self._stack_pending_remove:
+    keep_mask = torch.ones(len(self._stack_cache_keys), dtype=torch.bool)   # O(n_total)
+    ...
+    surviving_keys = [k for k, keep in zip(self._stack_cache_keys, keep_mask.tolist()) if keep]  # O(n_total)
+    ...
+    self._stack_cache_index = {k: i for i, k in enumerate(surviving_keys)}  # O(n_total)
+```
+
+Whenever `_stack_pending_remove` is non-empty *at all* — even one key —
+this allocates a mask sized to the entire current resident pool and
+rescans/rebuilds over every candidate. That's O(n_total) per dirty step,
+not O(k) (k = number actually removed) as the comment claims. And
+`_mark_inserted_into_stack_cache` (lines 206-215) queues a removal on
+*every overwrite* — "a key that already has a synced row... is also
+queued for removal of its stale row" — so under heavy preemption/
+re-admission churn (which `semantic-minmax` has 5-20x more of than
+lru/arc at `rag@rate=8.0`, per the "Update" section above), nearly every
+dirty step likely hits this O(n_total) branch, and it gets more expensive
+as the resident pool (`durable_summaries`) grows over the session —
+matching the observed 1.8x-6x marginal-cost growth directly.
+
+This closes the loop with what was already known: `semantic-minmax`
+preempts far more than lru/arc → more overwrite-driven insert+remove
+cycles → more O(n_total) compactions → each step gets slower → requests
+queue longer → more contention/preemption → repeat. A believable death
+spiral into the 1800s timeout. `query_captured_sync`/`query_captured_total`
+(the batched scoring pass over the full `cache`/`keys` stack) are also
+inherently O(n_candidates) per call by design, not obviously a bug on
+their own, but their growth is consistent with the same underlying
+cause — a growing resident pool.
+
+**NOT YET CONFIRMED — this is a strong code-reading inference, not a
+direct measurement.** Nothing this session actually measured
+`len(durable_summaries)` or `len(self._stack_cache_keys)` over time to
+confirm the pool is really what's growing (vs., e.g., growing purely from
+more total steps at constant pool size, which wouldn't fit as cleanly but
+hasn't been ruled out). **Next step before attempting a fix:** rerun with
+`SEMANTIC_OFFLOAD_DEBUG=1` alongside `SEMANTIC_OFFLOAD_TIMING=1` and grep
+`SEMANTIC_EVICT_DEBUG` in the server log (from `receive_evicted_keys()`'s
+`debug_print` at `worker.py:201-204`, format `received=<n> removed=<n>
+resident=<n>`) — if `resident=` climbs steadily over the run instead of
+holding near `_max_durable_summaries` (`= num_cpu_blocks`), that's direct
+confirmation the eviction signal (`receive_evicted_keys`, driven by the
+real `CachePolicy`'s evictions) isn't keeping the resident pool bounded
+under this load, and the O(n_total) compaction fix becomes worth doing.
+
+If confirmed, the fix direction is to make the removal-compaction branch
+actually O(k): e.g. swap-and-truncate the k removed indices with the last
+k surviving entries instead of building a full-length boolean mask and
+rescanning everything, or batch/defer removals instead of compacting on
+every dirty step.
+
 ## What's still open
 
 ### 2. semantic-mean/semantic-minmax hang at `chat` rate=8.0 — root cause NOT confirmed, NOT reproduced in the second pass (see update above)
@@ -231,13 +337,18 @@ writing any new code.
   them elsewhere (e.g. in a "third pass" or in `opt_3`/`opt_4`-style
   scripts).
 - Don't chase the chat@8.0 hang as originally scoped — it didn't reproduce
-  in the second pass. The confirmed, 3/3-reproduced bug going into the next
-  session is `semantic-minmax` hanging on `rag@rate=8.0` (see "Update" above),
-  which also poisons every later sub-workload in that same server session.
-  Get a `SEMANTIC_OFFLOAD_TIMING=1` breakdown on that specific
-  policy/workload/rate combo before changing any config or code — don't
-  retune workload parameters as a first move, the same lesson from the
-  2026-07-29 preemption-bug debugging applies here too.
+  in the second pass. The confirmed, 4/4-reproduced bug going into the next
+  session is `semantic-minmax` hanging on `rag@rate=8.0` (see "Update"
+  above), which also poisons every later sub-workload in that same server
+  session.
+- The timing breakdown is done (see "Update 2" above) and points at a
+  specific O(n_total)-per-dirty-step compaction in `worker.py`'s
+  `_rebuild_stack_cache()` (lines 247-260) that doesn't match its own
+  "incremental" docstring. **Not yet confirmed** — the next concrete step is
+  a `SEMANTIC_OFFLOAD_DEBUG=1 SEMANTIC_OFFLOAD_TIMING=1` rerun of the same
+  repro command, grepping `SEMANTIC_EVICT_DEBUG` for a climbing `resident=`
+  count. Only attempt the O(k) compaction fix after that confirms the pool
+  is actually what's growing.
 - `2.6-second-pass-result.csv` at the repo root now holds the second-pass
   data (216 rows); `2.6-result.csv` is the stale first-pass data. Both are
   untracked working copies, not committed.

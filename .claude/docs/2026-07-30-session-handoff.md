@@ -60,9 +60,85 @@ the next pass can be adjusted in place rather than re-derived from
 scratch. Output dir was also renamed `step_1_6_second_pass_*` (was
 `first_pass_*`) so the two runs don't get confused.
 
+## Update (same day): second-pass results are in — fix confirmed, hang moved
+
+The `--scale 0.08 --max-model-len 4096 --num-gpu-blocks-override 320` fix
+above was run for real this session
+(`results/step_1_6_second_pass_20260730_193645/`, `216` rows, parsed with
+`csv.DictReader`, not eyeballed). Two outcomes:
+
+**Fix confirmed working.** No more 0/N-completed rows on rag/longdoc, and
+`preemptions_delta` is non-zero across every policy/workload/rate cell that
+completed (e.g. rag@rate=2.0 now reads 0-3 preemptions, rag@rate=8.0 reads
+107-2158 depending on policy — see below). The block-budget arithmetic
+needs no further iteration.
+
+**But `semantic-minmax` hung on `rag@rate=8.0` in all 3 seeds — a
+different bug than the one described in section 2 below, not the same one
+reproducing.** The overall sweep reported "9/12 cells succeeded"; all 3
+failing cells are `semantic-minmax` (seed 1, 2, 3). Each hit
+`run_latency_suite.py`'s 1800s subprocess timeout on `rag@rate=8.0`, and —
+notably — every subsequent sub-workload in that same server session
+*also* timed out identically (`mixed/longdoc@0.5`, `mixed/rag@0.7`,
+`mixed/chat@0.8` all read the same "timed out after 1800s" error), until
+the 7200s per-cell watchdog killed the process. That's why all 3
+`semantic-minmax` seeds are missing the last 3 mixed-workload rows
+(rate 3.2/2.8/2.0 sub-cells) — the run never got there, not a data-logging
+gap.
+
+**The originally-reported chat@rate=8.0 hang (section 2 below) did NOT
+reproduce this run** — `chat@rate=8.0` reads `preemptions_delta=0.0` and
+no error for every policy, every seed. Treat that investigation as stale;
+the real, 3/3-reproduced hang this session is `semantic-minmax` /
+`rag` / `rate=8.0`, not `semantic-mean` / `chat` / `rate=8.0`.
+
+**Where semantic policies completed `rag@rate=8.0` (i.e. everything except
+the 3 hung `semantic-minmax` cells), they show a severe, quantified
+latency/preemption cliff vs. `lru`/`arc` under the identical new config:**
+
+| policy | seed | ttft_p50 | ttft_p99 | preemptions_delta |
+|---|---|---|---|---|
+| lru / arc | all 6 | ~36-38 ms | ~450-565 ms | 107-167 |
+| semantic-mean | 1 | 13,445 ms | 52,785 ms | 2158 |
+| semantic-mean | 2 | 193 ms | 14,154 ms | 923 |
+| semantic-mean | 3 | 2,174 ms | 19,555 ms | 1677 |
+| semantic-minmax | 1/2/3 | — (hung, no result) | — | 333-777 (partial, before kill) |
+
+5-20x more preemptions than lru/arc, and 30-100x worse TTFT tail where it
+didn't outright hang. This is a much larger, now-quantified version of the
+gap noted in `_debug.py`'s `DISABLE_PREFETCH` docstring (17 vs 5
+preemptions on an earlier, smaller run).
+
+One more isolated data point: `semantic-mean` seed=3 *only* also lost its
+last 3 mixed-workload rows (`chat@3.2`/`longdoc@2.0`/`rag@2.8`) to the same
+1800s-timeout pattern — seeds 1 and 2 completed those rows fine. Possibly
+flaky rather than deterministic; not yet enough evidence either way.
+
+Needle hit rate reads `1.0` for every policy including `lru`/`arc` in this
+sweep's `mixed`-workload needle sub-case — expected, not a contradiction of
+`step-0.4-adversarial-results.md`'s 0/16 lru/arc finding. This grid
+sweep's needle case isn't the dedicated adversarial-eviction test that
+produced that result; don't read anything into the two numbers agreeing or
+disagreeing.
+
+**Revised recommended next step:** the `SEMANTIC_OFFLOAD_TIMING=1` /
+`SEMANTIC_OFFLOAD_DISABLE_PREFETCH=1` approach in section 2 below is still
+the right tool, but point it at `semantic-minmax` / `rag` / `rate=8.0`
+(the reproduced hang) rather than `semantic-mean` / `chat` / `rate=8.0`
+(unreproduced). The preemption-storm angle (777+ preemptions in one run)
+is a stronger lead here than it was for the original chat@8.0 report,
+given `preemptions_delta` is very much non-zero this time — worth checking
+first whether the prefetch-admission-backpressure path in `connector.py`
+(described below) is now actually engaging and misbehaving under this much
+higher preemption volume, before assuming a different mechanism.
+`2.6-result.csv` at the ext repo root still holds the *first*-pass data;
+the second-pass CSV lives only on the DGX at
+`results/step_1_6_second_pass_20260730_193645/results.csv` and was not
+copied into this repo this session.
+
 ## What's still open
 
-### 2. semantic-mean/semantic-minmax hang at `chat` rate=8.0 — root cause NOT confirmed
+### 2. semantic-mean/semantic-minmax hang at `chat` rate=8.0 — root cause NOT confirmed, NOT reproduced in the second pass (see update above)
 
 In the first pass, both semantic policies (never `lru`/`arc`) hit
 `run_latency_suite.py`'s hardcoded 1800s subprocess timeout on the
@@ -152,9 +228,15 @@ writing any new code.
   a first attempt, not gospel — validate against a real run before reusing
   them elsewhere (e.g. in a "third pass" or in `opt_3`/`opt_4`-style
   scripts).
-- Don't re-attempt the chat@8.0 hang by tuning workload parameters again
-  (block budget, rate, `max_model_len`) the way the preemption bug got
-  fixed on 2026-07-29 — that pattern was tried repeatedly for *that* bug
-  and turned out to be masking a dead code path, not a tuning problem.
-  This one's `preemptions_delta=0.0` evidence suggests it's a different
-  class of bug; get a timing breakdown before changing any config or code.
+- Don't chase the chat@8.0 hang as originally scoped — it didn't reproduce
+  in the second pass. The confirmed, 3/3-reproduced bug going into the next
+  session is `semantic-minmax` hanging on `rag@rate=8.0` (see "Update" above),
+  which also poisons every later sub-workload in that same server session.
+  Get a `SEMANTIC_OFFLOAD_TIMING=1` breakdown on that specific
+  policy/workload/rate combo before changing any config or code — don't
+  retune workload parameters as a first move, the same lesson from the
+  2026-07-29 preemption-bug debugging applies here too.
+- Copy `results/step_1_6_second_pass_20260730_193645/results.csv` off the
+  DGX before that directory is cleaned up — it currently exists only there,
+  not in this repo. `2.6-result.csv` at the repo root is stale first-pass
+  data.

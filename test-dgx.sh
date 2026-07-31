@@ -287,6 +287,49 @@ opt_6_grid_sweep() {
   # target-duration-s 600 per cell x policies x workloads x rates x seeds).
   # Uses every GPU in $GPUS concurrently (auto-detected via nvidia-smi,
   # override with GPUS=0,1,... env var).
+  #
+  # --scale/--max-model-len/--num-gpu-blocks-override added 2026-07-30 after
+  # the first pass (results/step_1_6_first_pass_20260729_234213) came back
+  # mostly unusable: this command never passed any of the three, so it fell
+  # back to run_grid_sweep.py's defaults (max_model_len=2048,
+  # num_gpu_blocks_override=None i.e. unbounded auto-sized cache) -- the
+  # same "block budget never gets exercised" class of bug test 4 hit and
+  # fixed the night before (commits 4a0e740/0a4dea2/cc362df), just never
+  # carried over into this option:
+  #   - rag/longdoc workloads (harness/workloads.py, PRODUCTION-SCALE sizing)
+  #     need ~12.5k/~48.1k input tokens at scale=1.0 -- both far exceed a
+  #     2048 max_model_len, so vLLM rejected every single prompt and every
+  #     rag/longdoc row in the first pass read "0/N requests completed".
+  #   - num_gpu_blocks_override=None gave vLLM an auto-sized (huge) cache,
+  #     so memory pressure never materialized: preemptions_delta was 0.0 in
+  #     240/241 rows of the first pass. needle-v2's own built-in validity
+  #     check correctly flagged this as `not_pressured` rather than faking a
+  #     result (see run_latency_suite.py's needle-v2 branch comment).
+  #
+  # Values below (scale=0.08, max-model-len=4096, num-gpu-blocks-override=320)
+  # are a worked-out-but-UNVERIFIED first attempt, not a confirmed-good
+  # config -- there was no DGX access to test them at the time they were
+  # written. Reasoning: at scale=0.08, longdoc lands at ~3.8k tokens and rag
+  # at ~1.1k tokens (see harness/workloads.py's formulas), both comfortably
+  # under a 4096 max_model_len with headroom for output; 320 GPU blocks
+  # assumes vLLM's default 16-token block size, giving a ~256-block floor
+  # for one full max_model_len request (vLLM's own startup validation) plus
+  # ~25% headroom, the same ratio test 4's 40-block choice used over its
+  # 32-block floor at max_model_len=512. During the longdoc sub-workload
+  # (~241 blocks/request at this scale) that budget fits barely more than
+  # one concurrent request, which should force real preemption -- but this
+  # is arithmetic, not a measurement. First thing to check after running
+  # this: does preemptions_delta stop being ~0 and do rag/longdoc rows stop
+  # reading "0/N completed"? If not, the numbers need another pass.
+  #
+  # NOT addressed here: the separate semantic-mean/semantic-minmax hang at
+  # chat rate=8.0 (all 3 seeds in the first pass, `lru`/`arc` unaffected at
+  # the same rate) -- see .claude/docs/2026-07-30-session-handoff.md. That
+  # investigation is still open; do not assume this config change fixes it,
+  # and note tightening the block budget here could make it easier to
+  # reproduce (more contention) or could be unrelated (the first pass's hang
+  # happened with preemptions_delta=0.0, i.e. before any of today's budget
+  # tightening) -- still an open question.
   echo "Pre-run cleanup (stray vllm processes from earlier/crashed runs)..."
   _kill_vllm_processes
   _require_free_gpu || return 1
@@ -300,7 +343,10 @@ opt_6_grid_sweep() {
       --target-duration-s 600 \
       --cpu-bytes-to-use 2147483648 \
       --needle-reference-counts 0,1,2 \
-      --output-dir "results/step_1_6_first_pass_$(date +%Y%m%d_%H%M%S)" \
+      --scale 0.08 \
+      --max-model-len 4096 \
+      --num-gpu-blocks-override 320 \
+      --output-dir "results/step_1_6_second_pass_$(date +%Y%m%d_%H%M%S)" \
       --gpus "$GPUS"
   rc=$?
   echo "Post-run cleanup..."

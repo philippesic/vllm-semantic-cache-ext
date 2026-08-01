@@ -290,7 +290,7 @@ def test_run_needle_v2_case_classifies_from_recall_isolated_deltas():
 
     calls = {"n": 0}
 
-    def fake_complete(base_url, model, prompt, max_tokens, timeout_s):
+    def fake_complete(base_url, model, prompt, max_tokens, timeout_s, label=""):
         calls["n"] += 1
         return "code is 12345-Zephyr", 0.01
 
@@ -304,7 +304,7 @@ def test_run_needle_v2_case_classifies_from_recall_isolated_deltas():
             "vllm:kv_offload_store_bytes_total": 5000.0,
         }
 
-    def bump_load_on_recall(base_url, model, prompt, max_tokens, timeout_s):
+    def bump_load_on_recall(base_url, model, prompt, max_tokens, timeout_s, label=""):
         # the recall is the request whose prompt restates the needle +
         # question; bump the load counter to simulate a CPU-tier hit.
         if "Question:" in prompt:
@@ -333,7 +333,7 @@ def test_run_needle_v2_case_outcome_is_none_without_metrics_access():
     guessing."""
     from unittest.mock import patch
 
-    def fake_complete(base_url, model, prompt, max_tokens, timeout_s):
+    def fake_complete(base_url, model, prompt, max_tokens, timeout_s, label=""):
         return "code is 12345-Zephyr", 0.01
 
     with patch.object(needle_workload, "_complete", side_effect=fake_complete):

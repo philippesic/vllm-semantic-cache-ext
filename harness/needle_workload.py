@@ -199,7 +199,12 @@ def make_long_distractor(seed: int, target_words: int = 200) -> str:
 
 
 def _complete(
-    base_url: str, model: str, prompt: str, max_tokens: int, timeout_s: float
+    base_url: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    timeout_s: float,
+    label: str = "",
 ) -> tuple[str, float]:
     start = time.monotonic()
     resp = requests.post(
@@ -213,7 +218,23 @@ def _complete(
         timeout=timeout_s,
     )
     elapsed = time.monotonic() - start
-    resp.raise_for_status()
+    if not resp.ok:
+        # raise_for_status()'s message is just "400 Client Error: Bad
+        # Request for url: ..." -- the actual rejection reason (e.g. a
+        # context-length overflow) lives in the response body and was
+        # otherwise silently discarded, costing a full extra DGX round trip
+        # to recover manually, twice in one session (2026-08-01, see
+        # .claude/docs/2026-08-01-session-handoff.md). Surfacing the call
+        # label + prompt size + the body here means it lands in
+        # run_latency_suite.py's `error` CSV column for free next time, no
+        # ad hoc patching or word-count guessing needed to tell which of
+        # needle/probe/distractor/recall actually failed.
+        raise requests.HTTPError(
+            f"{resp.status_code} for {resp.url} [{label or 'call'}]: "
+            f"prompt_chars={len(prompt)} prompt_words={len(prompt.split())} "
+            f"max_tokens={max_tokens} body={resp.text[:300]}",
+            response=resp,
+        )
     data = resp.json()
     text = data["choices"][0]["text"]
     return text, elapsed
@@ -233,26 +254,30 @@ def run_needle_case(
     matching), `expected_code`, `recall_text`, and per-phase latencies."""
     needle_prompt, expected_code = make_needle(seed)
 
-    def complete(prompt: str, max_tokens: int = 60) -> tuple[str, float]:
-        return _complete(base_url, model, prompt, max_tokens, request_timeout_s)
+    def complete(
+        prompt: str, max_tokens: int = 60, label: str = ""
+    ) -> tuple[str, float]:
+        return _complete(base_url, model, prompt, max_tokens, request_timeout_s, label)
 
-    _, t_needle = complete(needle_prompt, max_tokens=8)
+    _, t_needle = complete(needle_prompt, max_tokens=8, label="needle")
 
     probe_latencies = []
     for i in range(reference_count):
-        _, t = complete(make_probe(seed + i), max_tokens=40)
+        _, t = complete(make_probe(seed + i), max_tokens=40, label=f"probe[{i}]")
         probe_latencies.append(t)
 
     distractor_latencies = []
     for i in range(num_distractors):
-        _, t = complete(make_distractor(seed + i), max_tokens=80)
+        _, t = complete(
+            make_distractor(seed + i), max_tokens=80, label=f"distractor[{i}]"
+        )
         distractor_latencies.append(t)
 
     recall_prompt = (
         f"{needle_prompt}\n\nQuestion: what is the secret verification "
         f"code mentioned above? Answer with ONLY the code, nothing else."
     )
-    recall_text, t_recall = complete(recall_prompt, max_tokens=20)
+    recall_text, t_recall = complete(recall_prompt, max_tokens=20, label="recall")
 
     return {
         "expected_code": expected_code,
@@ -407,14 +432,16 @@ def run_needle_v2_case(
     ``None`` (no metrics access = no preservation signal)."""
     needle_prompt, expected_code = make_needle(seed)
 
-    def complete(prompt: str, max_tokens: int = 60) -> tuple[str, float]:
-        return _complete(base_url, model, prompt, max_tokens, request_timeout_s)
+    def complete(
+        prompt: str, max_tokens: int = 60, label: str = ""
+    ) -> tuple[str, float]:
+        return _complete(base_url, model, prompt, max_tokens, request_timeout_s, label)
 
-    _, t_needle = complete(needle_prompt, max_tokens=8)
+    _, t_needle = complete(needle_prompt, max_tokens=8, label="needle")
 
     probe_latencies = []
     for i in range(reference_count):
-        _, t = complete(make_probe(seed + i), max_tokens=40)
+        _, t = complete(make_probe(seed + i), max_tokens=40, label=f"probe[{i}]")
         probe_latencies.append(t)
 
     distractor_latencies = []
@@ -424,7 +451,7 @@ def run_needle_v2_case(
             if distractor_words > 0
             else make_distractor(seed + i)
         )
-        _, t = complete(prompt, max_tokens=16)
+        _, t = complete(prompt, max_tokens=16, label=f"distractor[{i}]")
         distractor_latencies.append(t)
 
     recall_prompt = (
@@ -439,13 +466,13 @@ def run_needle_v2_case(
         before = _drain_store_counter(
             snapshot_metrics, settle_s=settle_s, max_polls=max_settle_polls
         )
-        recall_text, t_recall = complete(recall_prompt, max_tokens=20)
+        recall_text, t_recall = complete(recall_prompt, max_tokens=20, label="recall")
         after = snapshot_metrics()
         recall_load_bytes = after.get(_LOAD_KEY, 0.0) - before.get(_LOAD_KEY, 0.0)
         recall_store_bytes = after.get(_STORE_KEY, 0.0) - before.get(_STORE_KEY, 0.0)
         needle_outcome = classify_needle_outcome(recall_load_bytes, recall_store_bytes)
     else:
-        recall_text, t_recall = complete(recall_prompt, max_tokens=20)
+        recall_text, t_recall = complete(recall_prompt, max_tokens=20, label="recall")
 
     return {
         "expected_code": expected_code,

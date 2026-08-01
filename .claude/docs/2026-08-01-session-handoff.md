@@ -1,0 +1,171 @@
+# Session Handoff — 2026-08-01
+
+Follow-up to `2026-07-30-session-handoff.md`'s open item: confirm whether
+`durable_summaries`/`resident=` actually grows unbounded during the
+`semantic-minmax`/`rag`/`rate=8.0` hang. Picked that up, got real B200 data,
+then an unrelated dormant investigation surfaced mid-session and took over
+most of the time. Net: the original hang theory took a hit, and a separate,
+previously-undocumented, still-open regression was rediscovered and is now
+properly written down (it wasn't before — see "How this was found" below).
+
+## 1. The rag@8.0 hang: didn't reproduce, and the leading theory is now doubtful
+
+Ran the exact repro from 07-30's Update 2 (`semantic-minmax`/`rag`/`rate=8.0`/
+`seed=1`, `SEMANTIC_OFFLOAD_DEBUG=1 SEMANTIC_OFFLOAD_TIMING=1`, same
+`--scale 0.08 --max-model-len 4096 --num-gpu-blocks-override 320`) plus two
+comparison runs (same repro with `SEMANTIC_OFFLOAD_DISABLE_PREFETCH=1`; same
+repro on `semantic-mean` instead of `semantic-minmax`). All three completed
+normally — **no hang this time.** That makes it 4/5 reproductions of the
+hang across both sessions, not 4/4 as 07-30 concluded — treat "deterministic,
+not flaky" as wrong; this looks more like a race/timing-dependent condition
+than a monotonic resource leak, which changes where to look next.
+
+**`resident=` (from `SEMANTIC_EVICT_DEBUG`, i.e. `len(durable_summaries)`)
+stayed flat at 4675-4679 for the entire run** — bounded, not growing. This
+directly contradicts 07-30's leading theory (unbounded `durable_summaries`
+growth driving an ever-more-expensive O(n_total) `_rebuild_stack_cache`
+compaction). The eviction-based bound (`receive_evicted_keys`, replacing the
+old FIFO cap per issues log #62-64) is working as designed.
+
+**But the per-call timing growth from 07-30 still shows up even with a flat
+pool**: `query_captured_total` mean went 18.46ms → 43.93ms (2.4x) across
+calls 1-4000 on the (this time non-hanging) run, and 8.68ms → 12.56ms (1.4x)
+on the `semantic-mean` comparison run. Since `resident=` is flat, the O(n_total)
+compaction cost in `_rebuild_stack_cache` (worker.py:247-260, still unfixed,
+still real as a per-call cost) can't be scaling from a growing *candidate*
+pool. **Revised leading theory: the batch size on the query side (number of
+concurrently-active requests being scored per call) is what's growing, not
+the candidate pool.** Not yet confirmed — would need instrumenting
+`_on_queries_captured`'s `len(req_ids)` per call, not yet done.
+
+A 60s py-spy flamegraph was captured mid-run (`dgx_hang_diagnostic.sh`'s
+`run_a_flamegraph.svg`, on the DGX under
+`dgx_logs/hang_diag_20260801_153622/`) but since run A didn't hang this time,
+it's a healthy-operation profile, not a hang-state one — lower value than
+intended, not yet looked at.
+
+**Next step for the hang specifically:** instrument concurrent-request count
+per `_on_queries_captured` call (not candidate-pool size) and correlate with
+the timing growth; then retry the repro enough times to get a real
+reproduction rate (this session only had budget for one more attempt beyond
+07-30's three).
+
+## 2. How this was found: a dormant, undocumented regression from 2026-07-19
+
+While checking DGX provenance, two untracked files turned up in the ext repo
+working tree (`investigation_2_3_4.sh`/`.log`) that weren't from this session
+or referenced anywhere in memory or prior handoffs — the user didn't
+recognize them either. They turned out to be a fresh (same-day, 2026-08-01)
+rerun of an old, still-unresolved investigation:
+
+**`origin/diagnose-stack-rebuild-revert`** (branch, tip `cb8c0f1`, dated
+**2026-07-19** — 11 days before the partial-splice/hang work this project's
+memory and prior handoffs actually track) contains:
+
+- `4e116ec`: "DIAGNOSTIC ONLY: revert stack_rebuild to isolate B200
+  needle-v2 regression" — a same-session B200 grid run showed **all three
+  semantic policies missing needle-v2 recall at every reference_count,
+  including >=1, where they'd reliably hit in every prior validated run.**
+  `session_aware` was tested and ruled out (identical misses on/off).
+  `_rebuild_stack_cache`'s incrementalization (`557467b`, "make stack_rebuild
+  incremental instead of a full pool rebuild") was the one remaining
+  untested variable in that session's bundle.
+- `cb8c0f1`: also reverts `1aeab43` ("batch cross-request query captures
+  into one scored pass per step") — a second, independent optimization in
+  the same suspect bundle.
+- Both `557467b` and `1aeab43` are still live on `master` today, unreverted.
+  This branch was never merged and never resolved — just parked.
+
+**Today's `investigation_2_3_4.log` (run before this session started,
+author/timing unclear) reruns the same needle-v2 check on current `master`
+and gets the same failure**: every row (`lru`, `arc`, `semantic-minmax`,
+`semantic-mean`, and a policy not previously in memory —
+`semantic-cuboid-mean`) reads `needle_outcome=miss, needle_hit_rate=0.0`,
+including the semantic policies that are supposed to be the entire point
+(per `step-0.4-adversarial-results.md`, they should hit 0.96-1.0 on exactly
+this kind of adversarial-needle case). **13 days unresolved, still
+reproducing, real.**
+
+**Also newly-noted for whoever picks this back up:** `session_aware`,
+`chain_aware`, `capture_stride`, and the `semantic-cuboid-mean` policy exist
+in the codebase (commits `e74a4d2`/`39f37f0`/`e72e7e0`, 2026-07-19) but
+aren't mentioned in `semantic-cache-project` memory or any handoff doc before
+this one — that memory/handoff trail has a real gap covering this feature
+surface. Worth a dedicated read-through of what these do before next
+picking up needle-v2 work.
+
+## 3. Attempted revert-branch test — inconclusive, blocked on a separate bug
+
+Tried to settle whether reverting `557467b`/`1aeab43` fixes the needle-v2
+regression by cherry-picking `4e116ec`+`cb8c0f1` onto current `master`
+(clean cherry-pick, zero conflicts — confirmed `worker.py`/`query_capture.py`
+were untouched by any master commit since 07-19, so this is a faithful
+revert-on-current-master, not a stale rebase). Pushed as
+`test-revert-stack-rebuild-on-current-master`.
+
+Running the exact same needle-v2 command from `investigation_2_3_4.sh` Item
+#3 against this branch **failed with 400 Bad Request on every request**,
+identically on `master` too when retried — including `lru`, which never
+touches `semantic_offload`'s scoring/worker code at all. That ruled out the
+revert (or master) as the cause of the 400s specifically.
+
+Root cause (confirmed via response body, not guessed): **a distractor
+completion request's prompt is right at (or over) the `max_model_len`
+budget** — first seen as "497 input tokens + 16 output tokens = 513 >
+512 max_model_len". Tried bumping `--max-model-len 512→640` and
+`--num-gpu-blocks-override 120→150` (scaled together) to add headroom — **it
+did not help**: the reported input-token count scaled almost exactly with
+the change too (625 = 640-15, matching 497 = 512-15 from before), so
+whatever's sizing that prompt is coupled to one of those two launch
+parameters. **Not isolated which one** — both were changed together in the
+same test, so this is genuinely unresolved, not just "needs more margin."
+
+**This blocks any real revert-vs-master needle-v2 comparison until fixed.**
+Whoever picks this up next should NOT re-attempt the master/revert
+comparison until this is isolated first:
+1. Re-run with `max_model_len` fixed and only `num_gpu_blocks_override`
+   varied, then the reverse, to find which one the distractor sizing is
+   actually coupled to (grep `harness/needle_workload.py`'s
+   `make_long_distractor`/`run_needle_v2_case` call chain and
+   `benchmarks/run_grid_sweep.py`'s needle-v2 wiring for anything reading
+   `max_model_len` or block count when choosing `distractor_words` — nothing
+   obvious was found by a source grep this session, so the coupling may be
+   indirect, e.g. via tokenizer/vocab differences from a different model
+   config, not literal code coupling. Not yet run to ground.)
+2. Once fixed, rerun `investigation_2_3_4.sh`'s Item #3 config against both
+   `master` and `test-revert-stack-rebuild-on-current-master` for a clean
+   answer on whether the revert restores needle-v2 recall.
+
+Diagnostic technique note for next time: `harness/needle_workload.py`'s
+`_complete()` calls `resp.raise_for_status()` without ever reading
+`resp.text` — the client-side error string ("400 Client Error: Bad Request
+for url: ...") never carries the actual rejection reason. A local, uncommitted
+one-line patch printing `resp.text` on non-2xx (in the CLIENT-side
+`cell_<policy>_seed<seed>.log`, NOT the server log — different process) is
+what actually surfaced the real message both times this session. Worth
+making this a permanent (committed) improvement rather than re-patching it
+ad hoc every time — cheap, high-value, already proven necessary twice now
+in unrelated sessions (07-30's CSV-parsing warning is the same class of
+"the summary lies, read the raw data" lesson).
+
+## For the next agent picking this up
+
+- Don't trust "resolved"/"deterministic" claims in prior handoffs without
+  re-checking — both the hang's "4/4 deterministic" and needle-v2's
+  complete absence from memory turned out to be wrong/incomplete this
+  session. Memory and handoffs are a curated narrative, not a full state
+  dump; a `git branch -a` + untracked-file check on the actual DGX/ext repo
+  surfaced 11 days of real, unresolved work that no doc mentioned.
+- Hang investigation: pool-growth theory is dead (resident= is flat).
+  Query-side concurrent-batch-size growth is the new leading theory, not
+  yet instrumented. Reproduction rate is 4/5 across two sessions, not
+  deterministic — budget for multiple attempts, not one.
+- Needle-v2 regression (13+ days old, still reproducing) and the hang
+  investigation both implicate `_rebuild_stack_cache`
+  (`557467b`)/cross-request batching (`1aeab43`) — plausibly the same root
+  cause, plausibly not. Unconfirmed either way; the revert-branch test that
+  would settle it is blocked on the token-budget bug in section 3.
+- `test-revert-stack-rebuild-on-current-master` branch is pushed and ready
+  to reuse once the token-budget confound is isolated — don't recreate it.
+- `dgx_hang_diagnostic.sh` (repo root, committed) is reusable for the next
+  hang-repro attempt as-is.

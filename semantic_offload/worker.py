@@ -44,7 +44,7 @@ import time
 import torch
 
 from semantic_offload._debug import TIMING as _TIMING
-from semantic_offload._debug import debug_print, record_timing
+from semantic_offload._debug import debug_print, record_count, record_timing
 from semantic_offload._vllm_compat import init_cpu_offloading_worker_base
 from semantic_offload.index import (
     BlockSummary,
@@ -296,6 +296,16 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
     def _on_queries_captured(self, req_ids: list[str], queries: torch.Tensor) -> None:
         if not self.durable_summaries or not req_ids:
             return
+        # 2026-08-01: test whether query_captured_total's per-call cost
+        # growth (07-30/08-01 handoffs, rag@8.0) tracks batch size rather
+        # than resident-pool size -- resident= stayed flat in the last
+        # repro, so if batch size is flat too, neither is the mechanism and
+        # the next lead is elsewhere (e.g. cache/stack_cache_dirty churn
+        # rate itself). Recorded together so one grep correlates both
+        # against the same call cadence as SEMANTIC_TIMING.
+        if _TIMING:
+            record_count("query_captured_batch_size", len(req_ids))
+            record_count("query_captured_resident_pool", len(self.durable_summaries))
         _t_call = time.perf_counter() if _TIMING else 0.0
         # queries: [n_reqs, num_kv_heads, head_dim] -- one row per request
         # scheduled in this step. All concurrent requests are scored in ONE

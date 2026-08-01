@@ -54,6 +54,37 @@ def record_timing(bucket: str, dt: float) -> None:
         )
 
 
+# bucket -> [sum, count, max]
+_count_state: dict[str, list] = {}
+
+
+def record_count(bucket: str, value: int) -> None:
+    """Same accumulate-and-summarize-every-N-calls shape as `record_timing`,
+    but for a size/count value instead of a duration -- added 2026-08-01 to
+    test whether `_on_queries_captured`'s per-call cost growth (SEMANTIC_TIMING
+    bucket=query_captured_total climbing 2.4x within a single rag@8.0 run,
+    07-30/08-01 handoffs) tracks a growing concurrent-request batch size
+    (`len(req_ids)`) rather than the resident candidate pool, which stayed
+    flat (`resident=` in SEMANTIC_EVICT_DEBUG) across the same run. Prints
+    mean AND max per window so a spiky-but-flat-on-average batch size is
+    still visible. No-op unless SEMANTIC_OFFLOAD_TIMING is set (reuses that
+    flag rather than adding a third one)."""
+    if not TIMING:
+        return
+    slot = _count_state.setdefault(bucket, [0, 0, 0])
+    slot[0] += value
+    slot[1] += 1
+    slot[2] = max(slot[2], value)
+    if slot[1] % _TIMING_EVERY == 0:
+        total, count, peak = slot[0], slot[1], slot[2]
+        print(
+            f"SEMANTIC_COUNT bucket={bucket} pid={os.getpid()} calls={count} "
+            f"mean={total / count:.2f} max={peak}",
+            flush=True,
+        )
+        slot[2] = 0
+
+
 # TEMPORARY diagnostic toggle (issues log entry #53's follow-up): a real
 # B200 run showed semantic-minmax causing MORE GPU preemptions than lru
 # under an identical, tight-capacity config (17 vs 5), and each preempted

@@ -169,3 +169,86 @@ in unrelated sessions (07-30's CSV-parsing warning is the same class of
   to reuse once the token-budget confound is isolated — don't recreate it.
 - `dgx_hang_diagnostic.sh` (repo root, committed) is reusable for the next
   hang-repro attempt as-is.
+
+## Update (same day, no-DGX follow-up): instrumentation added, one real fix landed
+
+No box access for this part — code-only work, done off the diagnostics
+above. Three commits on `master` (`d24063d`, `7a068e1`), also merged
+cleanly into `test-revert-stack-rebuild-on-current-master` (`3e93096`, no
+conflicts — `worker.py`'s auto-merge picked up the new instrumentation
+around the still-reverted `_rebuild_stack_cache`/scoring internals without
+issue).
+
+**1. Batch-size instrumentation for the hang (`_debug.py`/`worker.py`).**
+New `record_count(bucket, value)` in `_debug.py`, same shape as
+`record_timing` (accumulate, print mean+max every
+`SEMANTIC_OFFLOAD_TIMING_EVERY` calls), gated on the same
+`SEMANTIC_OFFLOAD_TIMING=1` flag. Wired into `_on_queries_captured` to log
+`len(req_ids)` (`query_captured_batch_size`) and `len(durable_summaries)`
+(`query_captured_resident_pool`) together, every call, so the next repro's
+`grep SEMANTIC_COUNT` directly confirms or kills the "growing concurrent
+batch size" theory in one line instead of cross-referencing separate log
+streams. **Not yet run against a real repro** — next DGX pass should rerun
+`semantic-minmax`/`rag`/`rate=8.0` with `SEMANTIC_OFFLOAD_TIMING=1` and
+check whether `query_captured_batch_size`'s mean/max climbs alongside
+`query_captured_total`'s per-call cost. If it's flat too, this theory is
+also dead and the next lead is unknown — don't assume it's confirmed just
+because the instrumentation exists now.
+
+**2. Isolate the needle-v2 token-budget confound (code read, no DGX).**
+Traced the full path (`make_long_distractor` → `run_needle_v2_case` →
+`run_latency_suite.py` → `run_grid_sweep.py`) and confirmed
+`distractor_words` is a hardcoded `200`, never derived from `max_model_len`
+or `num_gpu_blocks_override` anywhere in this codebase — content generation
+for a given `(seed, reference_count, i)` is fully deterministic and should
+be byte-identical regardless of server launch config. **This rules out an
+explicit harness-level coupling** but does NOT explain the earlier
+observation (reported input-token count scaling almost exactly with
+`max_model_len - 15` at both 512 and 640). Since `max_model_len` and
+`num_gpu_blocks_override` were changed together in that test, it's still
+unknown which one (if either) the effect is actually coupled to, or whether
+it's a vLLM-server-side quirk unrelated to this project's code. **Needs a
+live, single-variable test to resolve — not resolvable from code alone.**
+
+**3. Real fix landed: `_complete()` in `harness/needle_workload.py` no
+longer swallows the response body.** This is what cost two extra DGX
+round-trips today (`resp.raise_for_status()`'s message never included
+*why* a request was rejected). Now raises `requests.HTTPError` with the
+call's label (`needle`/`probe[i]`/`distractor[i]`/`recall`), prompt
+char/word count, and the response body (truncated to 300 chars) baked in
+— lands directly in `run_latency_suite.py`'s `error` CSV column, no manual
+patching needed next time. Threaded a `label` kwarg through both
+`run_needle_case` and `run_needle_v2_case`'s local `complete()` closures.
+Updated the two `test_harness.py` mocks that patch `_complete` wholesale
+to accept the new kwarg. **Not run locally** (no `pytest`/`requests` in
+this Mac checkout) — run `test-dgx.sh` option 2 (or plain
+`pytest tests/`) on the next DGX pass before trusting it.
+
+### Next DGX session — concrete plan, in priority order
+
+1. **Sanity first**: `pytest tests/` on `master` — confirms the
+   `test_harness.py` mock updates from step 3 above actually pass (written
+   blind, no local Python env to verify against).
+2. **Isolate the needle-v2 confound** (step 2 above) with two single-variable
+   runs, reusing `investigation_2_3_4.sh` Item #3's exact command as the
+   base: (a) `--max-model-len 1024 --num-gpu-blocks-override 120`
+   (blocks held at the original value, only `max_model_len` raised well
+   past any plausible overflow); (b) `--max-model-len 512
+   --num-gpu-blocks-override 320` (max_model_len held at the original
+   value, only blocks raised). Whichever one still 400s identifies the
+   real coupling; if *neither* 400s, the earlier failures might have been
+   something else entirely (worth re-reading the (now much more
+   informative, per fix 3 above) `error` column either way). This no
+   longer needs the manual response-body patch from today — the real fix
+   is already in `_complete()`.
+3. **Once needle-v2 requests complete cleanly**, rerun
+   `investigation_2_3_4.sh` Item #3's config against both `master` and
+   `test-revert-stack-rebuild-on-current-master` (already merged with
+   today's fixes, ready to use) for the real answer on whether the revert
+   restores needle-v2 recall.
+4. **Hang repro**: rerun `semantic-minmax`/`rag`/`rate=8.0` with
+   `SEMANTIC_OFFLOAD_TIMING=1` (now including the new
+   `SEMANTIC_COUNT`/`query_captured_batch_size` lines from fix 1 above).
+   Budget for multiple attempts (today's session got 1 non-repro out of 1
+   try; the real rate across both sessions is 4/5) — a single non-hang
+   isn't evidence the hang is gone.

@@ -252,3 +252,78 @@ this Mac checkout) — run `test-dgx.sh` option 2 (or plain
    Budget for multiple attempts (today's session got 1 non-repro out of 1
    try; the real rate across both sessions is 4/5) — a single non-hang
    isn't evidence the hang is gone.
+
+## Update (same day, back on DGX): confound isolated cleanly, revert test is inconclusive at n=1
+
+Ran the plan above, steps 1-3, same day.
+
+**Step 1 (sanity):** `pytest tests/ -k needle` — 22/22 passed on `master`.
+The blind `test_harness.py` mock updates from the no-DGX pass are good.
+
+**Step 2 (isolate the token-budget confound) — fully resolved, and it was
+never about `num_gpu_blocks_override`:**
+- 2a: `--max-model-len 1024 --num-gpu-blocks-override 120` (blocks held at
+  the *original* value that was failing, only `max_model_len` raised) — all
+  15 cells succeeded, zero errors.
+- 2b: `--max-model-len 512 --num-gpu-blocks-override 320` (max_model_len
+  held at the original failing value, only blocks raised) — every cell
+  failed with the *identical* "497 input tokens, max 512" error as the very
+  first debug run.
+
+**Conclusion: `max_model_len` alone gates it; `num_gpu_blocks_override` was
+never involved.** The earlier apparent coupling to both params was an
+artifact of scaling them together in the same test. vLLM's own error
+phrasing ("at least X input tokens") was the tell in hindsight — that
+reads as a lower-bound from an early-exit length check, which is exactly
+why it tracked `max_model_len` almost linearly (`X ≈ max_model_len - 15`
+at both 512 and 640) rather than being a fixed number. Fix for any future
+needle-v2 run with `distractor_words=200` at this model's tokenization
+rate (~2.5 tokens/word for the synthetic corpus): use `--max-model-len
+1024` or higher, not 512.
+
+**Step 2a also gave the first uncorrupted needle-v2 data of this
+investigation, and it does NOT match either prior report:**
+
+| policy | ref_count=0 | ref_count=1 | ref_count=2 |
+|---|---|---|---|
+| lru / arc | miss | miss | miss |
+| semantic-mean | miss | **hit** | miss |
+| semantic-cuboid-mean | miss | **hit** | **hit** |
+| semantic-minmax | miss | miss | miss |
+
+Neither the 07-19 branch's claim ("all three semantic policies missing
+needle-v2 recall") nor a fully-working picture — `semantic-mean` and
+`semantic-cuboid-mean` DO preserve the needle at `reference_count>=1` as
+designed. **Only `semantic-minmax` fails to hit at all**, and
+`semantic-minmax` is also the policy that hung on `rag@8.0` in the earlier
+hang investigation — a real, narrower correlation than "the regression
+affects all semantic policies" implied.
+
+**Step 3 (revert-branch comparison on the now-clean config) — inconclusive,
+looks like noise at n=1, not a signal:**
+
+| policy | master | revert branch |
+|---|---|---|
+| semantic-minmax | miss, miss, miss | miss, miss, **hit** |
+| semantic-mean | miss, **hit**, miss | miss, **hit**, miss (identical) |
+| semantic-cuboid-mean | miss, **hit**, **hit** | miss, miss, miss (worse) |
+
+`semantic-minmax` picked up one hit under the revert; `semantic-mean` is
+byte-identical either way; `semantic-cuboid-mean` got *worse* under the
+revert. With one seed per cell this doesn't look like a deterministic
+effect of the code change — more consistent with hit/miss being
+probabilistic near a threshold (plausibly `session_aware`'s EMA relevance
+score landing close to a cutoff) than with the revert fixing or breaking
+anything. **Do not conclude the revert helps or hurts from this table.**
+
+**Next step, if anyone picks this back up:** rerun step 3's exact config
+with `--seeds 1,2,3` (or more) on both `master` and
+`test-revert-stack-rebuild-on-current-master` and compare *hit rate
+across seeds*, not single-seed hit/miss — that's the only way to
+distinguish a real effect from this noise. Given how much DGX time this
+thread has already consumed across two sessions, this is a "when there's
+budget for it" item, not urgent — the higher-value open thread is still
+the `rag@8.0` hang itself (section 1/4 above), which `semantic-minmax`'s
+isolated failure here makes a slightly more plausible shared root cause
+with, but that's still unconfirmed, not a reason to chase needle-v2
+further right now.

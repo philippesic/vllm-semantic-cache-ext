@@ -91,33 +91,41 @@ git checkout master 2>&1 | tee -a "$META"
 
 # ---------------------------------------------------------------------------
 # Step 3: needle-v2 multi-seed, master vs revert branch.
-# Config: max_model_len=1024/num_gpu_blocks_override=120 is the confirmed
-# clean (non-400ing) config from 2026-08-01's step 2a. 3 seeds (n=1 was
-# noise, not signal, per that session's table). --num-prompts controls the
-# default distractor count when --needle-num-distractors isn't given --
-# ADJUST if investigation_2_3_4.sh (step 0 above) showed a different value.
+#
+# This is investigation_2_3_4.sh's real Item #3 command (recovered live
+# from the DGX filesystem 2026-08-02 -- that script was never committed,
+# so an earlier version of this step reconstructed the wrong config: wrong
+# model, wrong entrypoint, wrong cpu-bytes-to-use, missing extra-config --
+# and produced invalid all-hit data with zero discriminating power. See
+# .claude/docs/2026-08-02-session-handoff.md section 1 before touching
+# this again. Uses run_grid_sweep.py (not run_latency_suite.py directly)
+# because that's what actually applies --extra-config per cell and
+# supports --seeds as a real multi-seed loop instead of one invocation
+# per seed.
 # ---------------------------------------------------------------------------
+NEEDLE_MODEL="Qwen/Qwen2.5-7B-Instruct"
 POLICIES="lru,arc,semantic-mean,semantic-cuboid-mean,semantic-minmax"
-SEEDS="1 2 3"
+SEEDS="1,2,3"
 
 for branch in master test-revert-stack-rebuild-on-current-master; do
   git checkout "$branch" 2>&1 | tee -a "$META"
-  for seed in $SEEDS; do
-    echo "=== Step 3: needle-v2, branch=$branch seed=$seed ===" | tee -a "$META"
-    _kill_vllm
-    python benchmarks/run_latency_suite.py \
-      --model "$MODEL" \
-      --policies "$POLICIES" \
-      --workloads needle-v2 \
-      --needle-reference-counts 0,1,2 \
-      --num-prompts 5 \
-      --max-model-len 1024 \
-      --num-gpu-blocks-override 120 \
-      --seed "$seed" \
-      --output-dir "$OUTDIR/needle_v2_${branch//\//_}_seed${seed}" \
-      2>&1 | tee "$OUTDIR/03_needle_${branch//\//_}_seed${seed}.log"
-    _kill_vllm
-  done
+  echo "=== Step 3: needle-v2, branch=$branch seeds=$SEEDS ===" | tee -a "$META"
+  _kill_vllm
+  python benchmarks/run_grid_sweep.py \
+    --model "$NEEDLE_MODEL" \
+    --policies "$POLICIES" \
+    --workloads needle-v2 \
+    --needle-reference-counts 0,1,2 \
+    --num-prompts 12 \
+    --max-model-len 512 \
+    --num-gpu-blocks-override 120 \
+    --cpu-bytes-to-use 91750400 \
+    --seeds "$SEEDS" \
+    --extra-config '{"session_aware": true, "session_bonus_half_life": 8}' \
+    --gpus 0,1,2,3,4,5,6,7 \
+    --output-dir "$OUTDIR/needle_v2_${branch//\//_}" \
+    2>&1 | tee "$OUTDIR/03_needle_${branch//\//_}.log"
+  _kill_vllm
 done
 git checkout master 2>&1 | tee -a "$META"
 

@@ -92,16 +92,27 @@ git checkout master 2>&1 | tee -a "$META"
 # ---------------------------------------------------------------------------
 # Step 3: needle-v2 multi-seed, master vs revert branch.
 #
-# This is investigation_2_3_4.sh's real Item #3 command (recovered live
-# from the DGX filesystem 2026-08-02 -- that script was never committed,
-# so an earlier version of this step reconstructed the wrong config: wrong
-# model, wrong entrypoint, wrong cpu-bytes-to-use, missing extra-config --
-# and produced invalid all-hit data with zero discriminating power. See
-# .claude/docs/2026-08-02-session-handoff.md section 1 before touching
-# this again. Uses run_grid_sweep.py (not run_latency_suite.py directly)
-# because that's what actually applies --extra-config per cell and
-# supports --seeds as a real multi-seed loop instead of one invocation
-# per seed.
+# Base command is investigation_2_3_4.sh's real Item #3 command (recovered
+# live from the DGX filesystem 2026-08-02 -- that script was never
+# committed, so an earlier version of this step reconstructed the wrong
+# config: wrong model, wrong entrypoint, wrong cpu-bytes-to-use, missing
+# extra-config -- and produced invalid all-hit data with zero
+# discriminating power. See .claude/docs/2026-08-02-session-handoff.md
+# section 1.)
+#
+# --max-model-len is 1024, NOT Item #3's literal 512: 2026-08-01 already
+# root-caused and fixed this exact 400 ("prompt contains at least 497
+# input tokens... max 512") for needle-v2 -- 512 is too small for the
+# 200-word distractors at this model's tokenization rate, purely a
+# max_model_len issue, num_gpu_blocks_override was never involved (see
+# 2026-08-01-session-handoff.md). A first pass of this script replayed
+# Item #3's literal 512 verbatim and reintroduced the exact same 400s
+# 2026-08-02 -- don't repeat that; keep this at 1024+ for needle-v2 runs
+# regardless of what any recovered investigation script says.
+#
+# Uses run_grid_sweep.py (not run_latency_suite.py directly) because
+# that's what actually applies --extra-config per cell and supports
+# --seeds as a real multi-seed loop instead of one invocation per seed.
 # ---------------------------------------------------------------------------
 NEEDLE_MODEL="Qwen/Qwen2.5-7B-Instruct"
 POLICIES="lru,arc,semantic-mean,semantic-cuboid-mean,semantic-minmax"
@@ -117,7 +128,7 @@ for branch in master test-revert-stack-rebuild-on-current-master; do
     --workloads needle-v2 \
     --needle-reference-counts 0,1,2 \
     --num-prompts 12 \
-    --max-model-len 512 \
+    --max-model-len 1024 \
     --num-gpu-blocks-override 120 \
     --cpu-bytes-to-use 91750400 \
     --seeds "$SEEDS" \

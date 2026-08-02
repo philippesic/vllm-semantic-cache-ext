@@ -146,3 +146,46 @@ the two now-eliminated theories.
 3. Low priority, unblocked whenever picked up: `dgx_next_session.sh`'s
    step 3 config should be fixed per item 1 rather than left as a
    standing trap for the next person who runs it unmodified.
+
+## Update (same day, second pass): needle-v2 regressed AGAIN (own mistake), hang data got better this time
+
+Reran the script immediately after the fix above. Two outcomes:
+
+**Needle-v2: 30/30 cells failed, same 400 as before the fix landed.** The
+"fix" in item 1 above still used Item #3's literal `--max-model-len 512`
+verbatim — but 2026-08-01 had *already* root-caused and fixed this exact
+error (497-input-token prompts vs. a 512 cap) by raising `max_model_len`
+to 1024, established as a `max_model_len`-only issue with
+`num_gpu_blocks_override` never involved. Copying Item #3's recovered
+command verbatim reintroduced a bug that was already fixed and documented
+one session ago. **Corrected: `--max-model-len` is now 1024 in the
+script** (`num_gpu_blocks_override` unchanged at 120). Needle-v2 master-
+vs-revert comparison is still unresolved — this was the second wasted
+attempt in a row, for two different reasons (config reconstruction, then
+reverting a known fix). Whoever runs this next should sanity-check the
+actual `results.csv` for `error` columns before trusting a "done" grid
+sweep, not just the "N/N cells succeeded" summary line (grid sweep
+"succeeded" here just means every server process exited cleanly, not that
+requests succeeded).
+
+**Hang: still no hang (Run A exit 0 again), but this run's timing data is
+the clearest replication yet of 07-30/08-01's per-call cost growth.**
+`query_captured_total` mean went 17.87ms (calls=2000) -> 43.13ms
+(calls=4000), a 2.4x increase within one run -- matching 08-01's own
+non-hang run's growth factor almost exactly. `update_relevance` also
+roughly doubled (4.08ms -> 8.83ms). Unlike the first pass today (flat
+batch size), this run's `query_captured_batch_size` showed real, if
+modest, growth: mean 3.96 -> 4.58 (+16%), max 11 -> 13. That's not nearly
+enough growth on its own to explain a 2.4x cost increase, but it's the
+first run where batch size moved at all instead of being perfectly flat --
+worth tracking across future repro attempts rather than treating as fully
+dead. `resident_pool`'s cumulative-mean artifact (see main body above)
+reproduced identically (2694 -> 3686, same warmup-then-flat-at-~4679
+interpretation, no real growth).
+
+**Bottom line for next session:** the systemic/allocator-overhead theory
+from the main body is still the best untested lead for the *cost* growth;
+batch-size growth is no longer fully dead but is clearly not sufficient
+alone. Needle-v2 needs a clean rerun with the now-corrected
+`--max-model-len 1024`, and results should be spot-checked for `error`
+columns before being trusted.

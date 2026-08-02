@@ -11,9 +11,11 @@
 # the terminal -- paste the terminal output back; if it's too long, paste
 # 00_meta.log plus the *_trend.txt files, or scp/cat the whole directory.
 #
-# Runtime: ~60-90 min (run A is expected to hang and hit the harness's own
-# 1800s timeout on purpose -- that's what gives us the full resident=/timing
-# growth curve, not just early samples).
+# Runtime: ~60-90 min. NOTE (updated 2026-08-02): the hang is now known to be
+# flaky, not deterministic -- 2+ non-reproductions (08-01, 08-02) on top of
+# 07-30's original 3/3, so run A may well complete normally. Even a non-hang
+# run is useful: it still captures the per-call timing/GPU-memory growth curve
+# that reproduces every run whether or not it tips into a full hang.
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,14 +55,16 @@ if ! command -v py-spy >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# Run A: the confirmed 4/4 repro (semantic-minmax / rag / rate=8.0) with
-# both SEMANTIC_OFFLOAD_DEBUG=1 (SEMANTIC_EVICT_DEBUG resident= lines from
-# worker.py's receive_evicted_keys) and SEMANTIC_OFFLOAD_TIMING=1 (per-bucket
-# timing growth). Expected to hang and hit the 1800s subprocess timeout --
-# intentional, we need the growth curve across the whole hang.
+# Run A: the flaky repro (semantic-minmax / rag / rate=8.0), config identical
+# to 07-30's Update 2 command, with both SEMANTIC_OFFLOAD_DEBUG=1
+# (SEMANTIC_EVICT_DEBUG resident= lines from worker.py's receive_evicted_keys)
+# and SEMANTIC_OFFLOAD_TIMING=1 (per-bucket timing growth, SEMANTIC_COUNT
+# batch/pool size, SEMANTIC_GPUMEM allocator counters). May hang and hit the
+# 1800s subprocess timeout, or complete normally (see header note) -- either
+# way it captures the whole growth curve.
 # ---------------------------------------------------------------------------
 GPU_A=$(_pick_free_gpu)
-echo "=== Run A: semantic-minmax/rag/8.0, DEBUG+TIMING, GPU $GPU_A (expect ~30min hang) ===" | tee -a "$META"
+echo "=== Run A: semantic-minmax/rag/8.0, DEBUG+TIMING, GPU $GPU_A (may hang ~30min or complete) ===" | tee -a "$META"
 (
   CUDA_VISIBLE_DEVICES="$GPU_A" SEMANTIC_OFFLOAD_DEBUG=1 SEMANTIC_OFFLOAD_TIMING=1 \
   python benchmarks/run_latency_suite.py \
@@ -96,10 +100,13 @@ _kill_vllm
 
 grep "SEMANTIC_EVICT_DEBUG" "$OUTDIR"/run_a_minmax_rag8/server_*.log > "$OUTDIR/run_a_resident_trend.txt" 2>/dev/null
 grep "SEMANTIC_TIMING" "$OUTDIR"/run_a_minmax_rag8/server_*.log > "$OUTDIR/run_a_timing_trend.txt" 2>/dev/null
+grep "SEMANTIC_GPUMEM" "$OUTDIR"/run_a_minmax_rag8/server_*.log > "$OUTDIR/run_a_gpumem_trend.txt" 2>/dev/null
 echo "--- run_a resident= trend (last 20) ---" | tee -a "$META"
 tail -20 "$OUTDIR/run_a_resident_trend.txt" 2>/dev/null | tee -a "$META"
 echo "--- run_a timing trend (last 20) ---" | tee -a "$META"
 tail -20 "$OUTDIR/run_a_timing_trend.txt" 2>/dev/null | tee -a "$META"
+echo "--- run_a gpumem trend (last 20) ---" | tee -a "$META"
+tail -20 "$OUTDIR/run_a_gpumem_trend.txt" 2>/dev/null | tee -a "$META"
 
 # ---------------------------------------------------------------------------
 # Run B: same repro with the prefetch-on-preemption path disabled -- rules
@@ -139,10 +146,13 @@ _kill_vllm
 
 grep "SEMANTIC_EVICT_DEBUG" "$OUTDIR"/run_c_mean_rag8/server_*.log > "$OUTDIR/run_c_resident_trend.txt" 2>/dev/null
 grep "SEMANTIC_TIMING" "$OUTDIR"/run_c_mean_rag8/server_*.log > "$OUTDIR/run_c_timing_trend.txt" 2>/dev/null
+grep "SEMANTIC_GPUMEM" "$OUTDIR"/run_c_mean_rag8/server_*.log > "$OUTDIR/run_c_gpumem_trend.txt" 2>/dev/null
 echo "--- run_c resident= trend (last 20) ---" | tee -a "$META"
 tail -20 "$OUTDIR/run_c_resident_trend.txt" 2>/dev/null | tee -a "$META"
 echo "--- run_c timing trend (last 20) ---" | tee -a "$META"
 tail -20 "$OUTDIR/run_c_timing_trend.txt" 2>/dev/null | tee -a "$META"
+echo "--- run_c gpumem trend (last 20) ---" | tee -a "$META"
+tail -20 "$OUTDIR/run_c_gpumem_trend.txt" 2>/dev/null | tee -a "$META"
 
 tar czf "${OUTDIR}.tar.gz" "$OUTDIR"
 echo "=== DONE: ${OUTDIR}.tar.gz ===" | tee -a "$META"

@@ -44,7 +44,12 @@ import time
 import torch
 
 from semantic_offload._debug import TIMING as _TIMING
-from semantic_offload._debug import debug_print, record_count, record_timing
+from semantic_offload._debug import (
+    debug_print,
+    record_count,
+    record_gpu_memory,
+    record_timing,
+)
 from semantic_offload._vllm_compat import init_cpu_offloading_worker_base
 from semantic_offload.index import (
     BlockSummary,
@@ -306,6 +311,10 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         if _TIMING:
             record_count("query_captured_batch_size", len(req_ids))
             record_count("query_captured_resident_pool", len(self.durable_summaries))
+            # 2026-08-02: allocator-fragmentation theory (08-02 handoff) --
+            # snapshot GPU allocator counters on the same cadence to correlate
+            # with query_captured_total's per-call cost climb.
+            record_gpu_memory("query_captured")
         _t_call = time.perf_counter() if _TIMING else 0.0
         # queries: [n_reqs, num_kv_heads, head_dim] -- one row per request
         # scheduled in this step. All concurrent requests are scored in ONE

@@ -85,6 +85,51 @@ def record_count(bucket: str, value: int) -> None:
         slot[2] = 0
 
 
+# bucket -> call_count. Only the count is kept; the allocator stats
+# themselves are read fresh on each print step, never cached.
+_gpu_mem_state: dict[str, int] = {}
+
+
+def record_gpu_memory(bucket: str) -> None:
+    """Snapshot the CUDA caching allocator's fragmentation-relevant counters
+    on the same every-N-calls cadence as record_timing/record_count -- added
+    2026-08-02 to test the allocator-overhead theory (08-02 handoff): both
+    logical sizes (resident pool, concurrent batch) are flat, yet
+    query_captured_total's per-call cost still climbs ~2.4x within one rag@8.0
+    run, so the remaining suspect is allocator fragmentation from
+    _rebuild_stack_cache's fresh torch.cat/boolean-mask tensor per dirty step.
+    The stats are queried ONLY on print steps (every _TIMING_EVERY calls), not
+    every call, so this adds no per-call cost to the timed region it sits
+    beside. memory_stats() is a host-side read of allocator bookkeeping -- no
+    device sync. No-op unless SEMANTIC_OFFLOAD_TIMING is set, or if CUDA is
+    unavailable. Remove once the investigation closes."""
+    if not TIMING:
+        return
+    count = _gpu_mem_state.get(bucket, 0) + 1
+    _gpu_mem_state[bucket] = count
+    if count % _TIMING_EVERY != 0:
+        return
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    stats = torch.cuda.memory_stats()
+    allocated = stats.get("allocated_bytes.all.current", 0)
+    reserved = stats.get("reserved_bytes.all.current", 0)
+    # reserved-but-inactive-and-split is the caching allocator's fragmented
+    # slack; a climbing value alongside num_alloc_retries is the signature.
+    inactive_split = stats.get("inactive_split_bytes.all.current", 0)
+    retries = stats.get("num_alloc_retries", 0)
+    print(
+        f"SEMANTIC_GPUMEM bucket={bucket} pid={os.getpid()} calls={count} "
+        f"allocated_mb={allocated / 1048576:.1f} "
+        f"reserved_mb={reserved / 1048576:.1f} "
+        f"inactive_split_mb={inactive_split / 1048576:.1f} "
+        f"num_alloc_retries={retries}",
+        flush=True,
+    )
+
+
 # TEMPORARY diagnostic toggle (issues log entry #53's follow-up): a real
 # B200 run showed semantic-minmax causing MORE GPU preemptions than lru
 # under an identical, tight-capacity config (17 vs 5), and each preempted

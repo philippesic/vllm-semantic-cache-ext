@@ -189,3 +189,72 @@ batch-size growth is no longer fully dead but is clearly not sufficient
 alone. Needle-v2 needs a clean rerun with the now-corrected
 `--max-model-len 1024`, and results should be spot-checked for `error`
 columns before being trusted.
+
+## Update (third pass, same day): two DGX round-trips burned in a row on this script, so this pass fixed it for real instead of re-guessing
+
+After the second pass above also failed (the "fix" replayed
+`investigation_2_3_4.sh`'s literal `--max-model-len 512`, reintroducing the
+exact 400 that had already been fixed once), this pass did NOT ship another
+guess. Two independent Opus subagents did a full adversarial audit — one
+against every flag in step 3 (needle-v2) cross-referenced against all four
+handoff docs, one against the hang diagnostic and the underlying
+`worker.py`/`_debug.py` code — and everything both agents changed was then
+locally smoke-tested (not just re-read) before committing:
+
+- **Needle-v2 audit**: every flag in step 3 traced to a specific later fix,
+  not just the recovered Item #3 command (see the agent's own citations,
+  preserved in this doc's history). One dead-code landmine found and
+  fixed: `dgx_next_session.sh`'s top-level `MODEL=...1.5B...` default
+  (unused by any step, but sitting at the top of the file as exactly the
+  wrong value that caused the first pass's failure) — commented to make
+  clear it must never feed the needle-v2 invocation. `--gpus 0-7` confirmed
+  NOT a memory-pressure confound (`run_grid_sweep.py` gives each cell its
+  own isolated GPU/port/output-dir/process). `session_aware` in
+  `--extra-config` confirmed intentional, not a leftover, held constant
+  across both branches — kept as-is (see the agent's report for the
+  full ablation-vs-comparability tradeoff, not revisited here).
+- **Hang audit**: `dgx_hang_diagnostic.sh`'s hardcoded params confirmed to
+  match 07-30's Update 2 command byte-for-byte, not stale. No logical leak
+  found in `_rebuild_stack_cache` on a second independent read (agrees with
+  this doc's earlier section). Stale "4/4 confirmed repro, expected to
+  hang" language in the script's comments (contradicted by 2+
+  non-reproductions since) rewritten to describe it as flaky. **New:
+  `record_gpu_memory()` added to `_debug.py`, wired into `worker.py`'s
+  `_on_queries_captured`**, gated on the same `SEMANTIC_OFFLOAD_TIMING`
+  flag, printing `SEMANTIC_GPUMEM` (allocated/reserved/inactive-split MB,
+  `num_alloc_retries`) on the same every-2000-calls cadence as the existing
+  counters — queried only on print steps, not per-call, so it doesn't
+  distort the very timing it's trying to explain. This directly tests the
+  allocator-fragmentation theory that was the leading unconfirmed lead at
+  the end of this doc's main body. `dgx_hang_diagnostic.sh` updated to grep
+  and tail `SEMANTIC_GPUMEM` alongside the existing trends.
+- **Local smoke testing** (this session, no DGX needed): `run_grid_sweep.py`
+  has zero torch/vllm imports, so the exact step-3 command was actually run
+  locally (Mac, no GPU) — confirmed every flag name is valid and JSON
+  `--extra-config` parses. It failed fast on a missing `requests` module
+  (Mac-only gap, present on the DGX), but that run exposed a **real bug**:
+  when every cell crashes before its first write, `run_grid_sweep.py` never
+  creates `results.csv` at all. The CSV-validation block (added in the
+  second pass) would have silently skipped that case via glob-miss. Fixed
+  to iterate the two known branch dirs explicitly and treat a missing file
+  as an unambiguous top-level failure, then re-verified against synthetic
+  data: a missing file, a row with an embedded-quote-and-comma error
+  message (the exact class of string that broke naive `awk` parsing in the
+  2026-07-30 handoff), and clean all-hit data — all three cases produced
+  the correct banner/exit behavior. The step-2 pytest fail-fast
+  (`PIPESTATUS` read immediately after a `tee | tail` pipe, no intervening
+  command) was also isolated and confirmed correct in a standalone repro.
+- **Also added**: step 2 now halts the whole script (exit 1, tarballs logs
+  first) if pytest fails on either branch, instead of silently continuing
+  into GPU-hours on a known-broken build. Step 4's own `$META` summary now
+  mirrors `SEMANTIC_GPUMEM` alongside `SEMANTIC_COUNT` (previously only the
+  latter). Stale comments referencing a `NEEDLE_CMD` variable that no
+  longer exists (leftover from before step 3's command was hardcoded) were
+  removed from step 0.
+
+**Bottom line: `dgx_next_session.sh` is the first version of this script
+that had every step's config independently cross-checked against the full
+documented fix history AND had its failure-detection logic proven against
+real and synthetic failure cases before being handed back for a DGX run.**
+If it still fails, that's new information, not a repeat of a known bug —
+paste back the output rather than assuming it's another config mistake.

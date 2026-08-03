@@ -258,3 +258,93 @@ documented fix history AND had its failure-detection logic proven against
 real and synthetic failure cases before being handed back for a DGX run.**
 If it still fails, that's new information, not a repeat of a known bug —
 paste back the output rather than assuming it's another config mistake.
+
+## Update (fourth pass, same day): script ran clean end-to-end -- real answers on both open questions
+
+`dgx_next_session.sh` ran with zero errors on both branches (90/90 needle-v2
+rows, 0 with a populated `error` column; step 2 sanity passed on both
+branches) for the first time. This is the first genuinely clean multi-seed
+data this investigation has produced.
+
+### Needle-v2 master vs. revert: the revert does NOT help, and may make it worse
+
+Hit rate at `reference_count>=1` (18 cells per branch: 3 semantic policies x
+3 seeds x 2 ref_counts; `ref_count=0` excluded, correctly miss-only by
+design on both branches):
+
+| policy | master | revert |
+|---|---|---|
+| lru (control) | 0/6 | 0/6 |
+| arc (control) | 1/6 | 1/6 |
+| semantic-mean | 5/6 | 3/6 |
+| semantic-cuboid-mean | 2/6 | 1/6 |
+| semantic-minmax | 2/6 | 2/6 (different cells) |
+| **semantic combined** | **9/18 (50%)** | **6/18 (33%)** |
+
+The two non-semantic control policies (lru, arc) are byte-identical between
+branches -- same specific cells hit/miss -- which is a good sanity signal
+that the two arms are otherwise comparable and the difference in semantic
+policies isn't an artifact of run-to-run environment noise alone.
+`semantic-mean` regressed the most (seed 3 flipped from hit/hit at ref 1/2
+under master to miss/miss under the revert); `semantic-cuboid-mean` also
+went down one cell; `semantic-minmax` stayed at the same total but with
+different specific cells flipping (suggestive of a real hit/miss threshold
+effect, matching 08-01's EMA-near-a-cutoff theory, not pure noise).
+
+**This is now a real, 3-seed answer, not the n=1 noise from 08-01: the
+`diagnose-stack-rebuild-revert` branch does not fix the needle-v2
+regression, and directionally makes it worse.** 18 cells per arm is still
+not a large-N study and individual cells clearly have real variance (this
+is a live server, not a fully deterministic replay), but the direction is
+consistent across all three semantic policies -- never better under the
+revert, flat-to-worse in all three. Recommend not pursuing the revert
+further as a needle-v2 fix; the `_rebuild_stack_cache`/cross-request-batching
+commits it targets are very likely not the (or not the only) root cause of
+the needle-v2 regression. `session_aware` was on for both arms (unchanged
+methodology from 08-01), so this doesn't touch the open question of whether
+`session_aware` itself interacts with the regression.
+
+### Hang: still didn't reproduce (getting more confident this is genuinely rare/environment-dependent), but the allocator-fragmentation theory is now RULED OUT
+
+Run A completed normally again -- another non-repro on top of the growing
+pile. More importantly, this run has the first real `SEMANTIC_GPUMEM` data,
+and it's a clean negative result: allocator stats were essentially flat
+across the run in both Run A and Run C --
+
+- Run A: `allocated_mb` 4756.1 -> 4756.1 (unchanged), `reserved_mb` 5608.0
+  -> 5612.0 (+4MB, noise), `inactive_split_mb` 69.9 -> 69.9 (unchanged),
+  `num_alloc_retries` 0 -> 0.
+- Run C: all four fields completely unchanged between windows.
+
+Meanwhile `query_captured_total`'s per-call cost still climbed sharply in
+the same run (window-corrected: ~32ms for calls 1-2000 vs. ~56ms for calls
+2001-4000, roughly 1.7x -- computed by subtracting cumulative sums, same
+method as 08-02's earlier correction). **GPU memory fragmentation cannot be
+the cause of the per-call cost growth** -- `inactive_split_mb` (the
+fragmentation-specific counter) and `num_alloc_retries` (the clearest
+possible fragmentation smoking gun) are both dead flat while the cost
+roughly doubles. `query_captured_batch_size` also stayed small and nearly
+flat again this run (4.29->4.48 mean, +4%) -- nowhere near enough to
+explain a ~1.7x cost jump on its own, consistent with every prior run.
+
+**Three theories have now been instrumented and ruled out: candidate-pool
+growth (dead, 08-02 main body), concurrent-batch-size growth (consistently
+too small across every run that's measured it), and GPU allocator
+fragmentation (dead, this run). The per-call cost growth itself is real and
+reproduces in nearly every run regardless of whether it tips into a full
+hang -- but its cause is now unidentified after three ruled-out leads.**
+
+**Next theory, not yet instrumented:** since nothing GPU-side explains it,
+the remaining suspects are CPU-side -- Python-level GC/object-count pressure
+from the high churn of short-lived tensors and dict/set entries in
+`_rebuild_stack_cache`'s per-dirty-step `torch.cat`/mask-index allocations
+(GPU allocator stats wouldn't show this, since it's about CPU-side Python
+object bookkeeping and garbage-collector scan cost, not device memory), or
+contention from sharing an 8-GPU box with other concurrent processes/cells
+during the grid sweep step that ran immediately before this hang repro in
+the same script invocation (worth testing hang repro in isolation, without
+step 3 having just run 8 concurrent servers moments before, to rule out
+cross-step interference). A `gc.get_stats()` or `len(gc.get_objects())`
+snapshot on the same cadence as the existing counters would directly test
+the GC-pressure theory the same way `SEMANTIC_GPUMEM` tested the allocator
+one.

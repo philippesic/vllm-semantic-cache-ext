@@ -109,8 +109,9 @@ and controlled ablations.
     reference-count arm gets a fresh server/cache while reusing identical
     content for the same seed. Server and client commands use the vLLM CLI from
     the selected Python environment. Mixed counters are retained only as
-    approximate stress evidence. Single-GPU execution is the reproducible
-    default; multi-GPU concurrency is an explicit scaling override.
+    approximate stress evidence. The DGX runner currently uses the four
+    available GPUs (4–7); latency conclusions should be confirmed with an
+    isolated one-GPU rerun because cells share host resources.
 
 ## Important open opportunities
 

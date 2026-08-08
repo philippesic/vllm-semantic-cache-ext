@@ -6,40 +6,26 @@ Two extra channels, piggybacking on the existing worker<->scheduler metadata
 protocol (see .claude/docs/semantic-eviction-plan.md, Step 1.3):
 
 - scheduler -> worker: which OffloadKey(s) each store job_id represents
-  (`SemanticOffloadingConnectorMetadata.store_job_keys`). The worker needs
+  (`SemanticOffloadingConnectorMetadata.store_job_blocks`). The worker needs
   this to re-key its summaries by the stable OffloadKey identity instead of
   the transient GPU block_id they're computed from -- GPU blocks get reused
   for unrelated content once freed, but the CPU-tier block (and the need to
-  score it) long outlives that. Granularity: job-level, not per-block within
-  a job -- a store job's keys are attributed to all blocks in that job. This
-  is a known simplification (see issues log); most store jobs in practice
-  cover few blocks (offload is opportunistic, per-prefill-step), so the blur
-  is expected to be minor.
+  score it) long outlives that. The layout is exact for single-group jobs,
+  including multi-block chunks; ambiguous hybrid/sliding layouts are skipped
+  rather than assigned to the wrong key.
 - worker -> scheduler: computed relevance scores
   (`SemanticWorkerMetadata.pending_scores`), consumed by
   `SemanticOffloadingManager.update_relevance()` for the EMA-smoothed
   relevance state Step 1.4 will read from.
 """
 
+from __future__ import annotations
+
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-import time
-
-from semantic_offload._debug import DISABLE_PREFETCH as _DISABLE_PREFETCH
-from semantic_offload._debug import ENABLED as _DEBUG_ENABLED
-from semantic_offload._debug import TIMING as _TIMING
-from semantic_offload._debug import debug_print, record_timing
-from semantic_offload._vllm_compat import (
-    config_blocks_per_chunk,
-    construct_scheduler_base,
-    construct_worker,
-    create_offloading_spec,
-    group_config_tokens_per_block,
-    group_config_tokens_per_chunk,
-    scheduler_being_loaded_set,
-)
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
@@ -75,6 +61,22 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.outputs import KVConnectorOutput
 
+from semantic_offload._debug import DISABLE_PREFETCH as _DISABLE_PREFETCH
+from semantic_offload._debug import ENABLED as _DEBUG_ENABLED
+from semantic_offload._debug import TIMING as _TIMING
+from semantic_offload._debug import debug_print, record_count, record_timing
+from semantic_offload._vllm_compat import (
+    config_blocks_per_chunk,
+    construct_scheduler_base,
+    construct_worker,
+    create_offloading_spec,
+    group_config_tokens_per_block,
+    group_config_tokens_per_chunk,
+    scheduler_being_loaded_set,
+    set_next_stored_chunk_idx,
+)
+from semantic_offload.store_layout import build_store_job_layout
+
 if TYPE_CHECKING:
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.request import Request
@@ -87,7 +89,9 @@ RelevanceScores = dict[str, dict[str, list[tuple[OffloadKey, float]]]]
 # speculative prefetch reservation is allowed to hold, summed across all
 # concurrently-preempted requests -- the plan's own "≤5% of GPU blocks"
 # text, so a burst of preemptions can't starve real scheduling of blocks.
-PREFETCH_BUDGET_FRACTION = 0.05
+# Disabled by default until the DGX audit shows an aggregate TTFT win without
+# increasing preemptions. The feature remains available as a controlled knob.
+PREFETCH_BUDGET_FRACTION = 0.0
 
 
 @dataclass
@@ -112,9 +116,14 @@ class _PrefetchState:
 @dataclass
 class SemanticOffloadingConnectorMetadata(OffloadingConnectorMetadata):
     store_job_keys: dict[int, list[OffloadKey]] = field(default_factory=dict)
-    # req_id -> (src GPU block ids holding prefetched data, dst GPU block
+    # Exact key -> ordered source GPU blocks. Unlike store_job_keys, this
+    # preserves identity after the base scheduler stores keys in a set.
+    store_job_blocks: dict[int, list[tuple[OffloadKey, list[int]]]] = field(
+        default_factory=dict
+    )
+    # splice_id -> (src GPU block ids holding prefetched data, dst GPU block
     # ids the scheduler just officially allocated for the same keys).
-    splice_jobs: dict[str, tuple[list[int], list[int]]] = field(default_factory=dict)
+    splice_jobs: dict[int, tuple[list[int], list[int]]] = field(default_factory=dict)
     # Real evictions the manager's CachePolicy made this step (issues log
     # entries #62-64) -- lets the worker drop exactly these keys from
     # durable_summaries instead of approximating with a FIFO cap.
@@ -134,15 +143,16 @@ class SemanticOffloadingConnectorMetadata(OffloadingConnectorMetadata):
     # self._load_jobs, so their completion is still reported (unconditionally,
     # via completed_jobs) but never through finished_recving.
     prefetch_load_jobs: dict[int, TransferJob] = field(default_factory=dict)
+    reset_semantic_state: bool = False
 
 
 @dataclass
 class SemanticWorkerMetadata(OffloadingWorkerMetadata):
     pending_scores: RelevanceScores = field(default_factory=dict)
+    # splice_id -> number of workers that have completed the GPU copy.
+    completed_splices: dict[int, int] = field(default_factory=dict)
 
-    def aggregate(
-        self, other: "KVConnectorWorkerMetadata"
-    ) -> "KVConnectorWorkerMetadata":
+    def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetadata:
         assert isinstance(other, OffloadingWorkerMetadata)
         base = super().aggregate(other)
         merged_scores: RelevanceScores = {
@@ -150,10 +160,14 @@ class SemanticWorkerMetadata(OffloadingWorkerMetadata):
         }
         for method, reqs in getattr(other, "pending_scores", {}).items():
             merged_scores.setdefault(method, {}).update(reqs)
+        completed_splices = dict(self.completed_splices)
+        for splice_id, count in getattr(other, "completed_splices", {}).items():
+            completed_splices[splice_id] = completed_splices.get(splice_id, 0) + count
         return SemanticWorkerMetadata(
             completed_jobs=base.completed_jobs,
             transfer_stats=base.transfer_stats,
             pending_scores=merged_scores,
+            completed_splices=completed_splices,
         )
 
 
@@ -169,6 +183,17 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         # shape. See _vllm_compat.py.
         construct_scheduler_base(self, spec, vllm_config, kv_cache_config)
         self._pending_job_keys: dict[int, list[OffloadKey]] = {}
+        self._pending_job_blocks: dict[int, list[tuple[OffloadKey, list[int]]]] = {}
+        self._worker_reset_pending = False
+        self._reset_prefetch_releases: dict[int, tuple[list[int], int]] = {}
+        fraction = float(
+            getattr(spec, "extra_config", {}).get(
+                "prefetch_budget_fraction", PREFETCH_BUDGET_FRACTION
+            )
+        )
+        if not 0.0 <= fraction <= 1.0:
+            raise ValueError("prefetch_budget_fraction must be between 0 and 1")
+        self._prefetch_budget_fraction = fraction
         # Step 1.5 (semantic prefetch) needs a live reference to the
         # scheduler's GPU BlockPool to reserve a small budget of blocks
         # ahead of a preempted request's official resumption. Empirically
@@ -180,12 +205,14 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         # reference is the real feature's foundation; the verification
         # probe itself (reserve N, assert count, release, assert restored)
         # was temporary and has been removed after confirming the result.
-        self.gpu_block_pool: "BlockPool | None" = None
+        self.gpu_block_pool: BlockPool | None = None
         # req_id -> in-flight-or-ready prefetch. See _PrefetchState's
         # docstring for why this is separate from req_status.transfer_jobs.
         self._prefetched: dict[str, _PrefetchState] = {}
         self._prefetch_reserved_blocks = 0
-        self._pending_splice_jobs: dict[str, tuple[list[int], list[int]]] = {}
+        self._pending_splice_jobs: dict[int, tuple[list[int], list[int]]] = {}
+        self._pending_splice_releases: dict[int, tuple[list[int], int]] = {}
+        self._splice_counter = 0
         # Step 1.5 retry (issues log entry #25): on_request_preempted only
         # fires ONCE, at the instant a request is preempted -- entry #24
         # found that instant structurally has zero free GPU blocks under
@@ -206,10 +233,10 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         # for why), reset every step in build_connector_meta the same way.
         self._current_batch_prefetch_load_jobs: dict[int, TransferJob] = {}
 
-    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self.gpu_block_pool = gpu_block_pool
 
-    def on_request_preempted(self, request: "Request") -> None:
+    def on_request_preempted(self, request: Request) -> None:
         """Step 1.5: queue a just-preempted request for a prefetch
         reservation attempt -- the actual attempt always happens from
         _retry_pending_prefetches (issues log entry #27), never
@@ -223,7 +250,7 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         engine -- not yet observed live only because the tested workloads
         happened to never have free blocks at the preemption instant
         itself (issues log entry #24), not because it can't happen."""
-        if _DISABLE_PREFETCH:
+        if _DISABLE_PREFETCH or self._prefetch_budget_fraction == 0:
             return
         self._preempted_pending.add(request.request_id)
 
@@ -240,7 +267,7 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         crash risk its docstring describes -- _retry_pending_prefetches
         still excludes this step's preempted_req_ids from the attempt
         list, so timing is unchanged from when the hook fired)."""
-        if _DISABLE_PREFETCH:
+        if _DISABLE_PREFETCH or self._prefetch_budget_fraction == 0:
             return
         self._preempted_pending.update(scheduler_output.preempted_req_ids or ())
 
@@ -259,9 +286,14 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         if not self._preempted_pending:
             return
         if _DEBUG_ENABLED:
+            free_blocks = (
+                self.gpu_block_pool.get_num_free_blocks()
+                if self.gpu_block_pool
+                else None
+            )
             debug_print(
                 f"STALL_DEBUG retry_sweep pending={list(self._preempted_pending)} "
-                f"free_blocks={self.gpu_block_pool.get_num_free_blocks() if self.gpu_block_pool else None} "
+                f"free_blocks={free_blocks} "
                 f"reserved={self._prefetch_reserved_blocks} "
                 f"prefetched_keys={list(self._prefetched.keys())}"
             )
@@ -297,7 +329,7 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
             return True  # never will have keys to prefetch; stop retrying
 
         total_budget = int(
-            self.gpu_block_pool.num_gpu_blocks * PREFETCH_BUDGET_FRACTION
+            self.gpu_block_pool.num_gpu_blocks * self._prefetch_budget_fraction
         )
         remaining_budget = max(0, total_budget - self._prefetch_reserved_blocks)
         if remaining_budget <= 0:
@@ -392,7 +424,13 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         blocks = [self.gpu_block_pool.blocks[bid] for bid in state.gpu_block_ids]
         self.gpu_block_pool.free_blocks(blocks)
 
-    def request_finished(self, request: "Request"):
+    def _free_prefetch_blocks(self, block_ids: list[int]) -> None:
+        if not block_ids or self.gpu_block_pool is None:
+            return
+        blocks = [self.gpu_block_pool.blocks[bid] for bid in block_ids]
+        self.gpu_block_pool.free_blocks(blocks)
+
+    def request_finished(self, request: Request):
         # A request can finish (or abort) while still preempted, in which
         # case a still-pending retry attempt would otherwise loop forever --
         # this is the one lifecycle point that always fires before a
@@ -421,12 +459,53 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         if _DEBUG_ENABLED:
             meta = connector_output.kv_connector_worker_meta
             completed = getattr(meta, "completed_jobs", None)
+            transfers = {
+                rid: list(req_status.transfer_jobs)
+                for rid, req_status in self._req_status.items()
+                if req_status.transfer_jobs
+            }
             debug_print(
                 f"STALL_DEBUG update_connector_output completed_jobs={completed} "
                 f"live_jobs={list(self._jobs.keys())} "
-                f"transfer_jobs_by_req={ {rid: list(rs.transfer_jobs) for rid, rs in self._req_status.items() if rs.transfer_jobs} }"
+                f"transfer_jobs_by_req={transfers}"
             )
+        completed = dict(
+            getattr(connector_output.kv_connector_worker_meta, "completed_jobs", {})
+            or {}
+        )
+        completed_splices = dict(
+            getattr(
+                connector_output.kv_connector_worker_meta,
+                "completed_splices",
+                {},
+            )
+            or {}
+        )
         super().update_connector_output(connector_output)
+        for job_id, count in completed.items():
+            pending = self._reset_prefetch_releases.get(job_id)
+            if pending is None:
+                continue
+            block_ids, remaining = pending
+            remaining -= count
+            if remaining <= 0:
+                self._free_prefetch_blocks(block_ids)
+                self._prefetch_reserved_blocks -= len(block_ids)
+                del self._reset_prefetch_releases[job_id]
+            else:
+                self._reset_prefetch_releases[job_id] = (block_ids, remaining)
+        for splice_id, count in completed_splices.items():
+            pending = self._pending_splice_releases.get(splice_id)
+            if pending is None:
+                continue
+            block_ids, remaining = pending
+            remaining -= count
+            if remaining <= 0:
+                self._free_prefetch_blocks(block_ids)
+                self._prefetch_reserved_blocks -= len(block_ids)
+                del self._pending_splice_releases[splice_id]
+            else:
+                self._pending_splice_releases[splice_id] = (block_ids, remaining)
         # A prefetch whose owning request already finished/aborted while
         # its load job was still in flight has no one left to ever splice
         # it in (update_state_after_alloc, the only other place that
@@ -445,7 +524,7 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
             self._release_prefetch(req_id)
 
     def _compute_load_plan(
-        self, request: "Request", blocks, num_external_tokens: int
+        self, request: Request, blocks, num_external_tokens: int
     ) -> tuple[list[OffloadKey], list[int], int, int] | None:
         """Reproduces the base connector's single-group positional
         keys-to-load / destination-block computation (mirrors
@@ -488,7 +567,7 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         return keys_to_load, dst_block_ids, num_locally_computed_gpu_blocks, num_blocks
 
     def _try_splice_prefetch(
-        self, request: "Request", blocks, num_external_tokens: int
+        self, request: Request, blocks, num_external_tokens: int
     ) -> bool:
         """Step 1.5: splice whatever fraction of this request's official
         load an already-completed prefetch covers via a fast GPU-to-GPU
@@ -599,7 +678,16 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         self._current_batch_allocated_block_ids.update(
             bid for bid in splice_dst if bid != 0
         )
-        self._pending_splice_jobs[request.request_id] = (splice_src, splice_dst)
+        splice_id = self._splice_counter
+        self._splice_counter += 1
+        self._pending_splice_jobs[splice_id] = (splice_src, splice_dst)
+        # Detach the request lookup now, but keep every source reservation
+        # quarantined until all workers acknowledge the actual GPU splice.
+        detached = self._prefetched.pop(request.request_id)
+        self._pending_splice_releases[splice_id] = (
+            detached.gpu_block_ids,
+            self.config.num_workers,
+        )
 
         if remainder_keys:
             # A reduced reload for only the complementary remainder --
@@ -650,7 +738,7 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         # will get its own automatic complete_load() call when it finishes,
         # same as any other load.
         if req_status.offloading_context.policy == OffloadPolicy.BLOCK_LEVEL:
-            group_state.next_stored_block_idx = num_blocks
+            set_next_stored_chunk_idx(group_state, num_blocks)
         covered = len(splice_dst) / (len(splice_dst) + len(remainder_dst))
         debug_print(
             f"PREFETCH_EFFECT_DEBUG {request.request_id}: PARTIAL SPLICE "
@@ -660,7 +748,7 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         return True
 
     def update_state_after_alloc(
-        self, request: "Request", blocks, num_external_tokens: int
+        self, request: Request, blocks, num_external_tokens: int
     ) -> None:
         # Being re-admitted at all means this request is no longer
         # preempted -- stop retrying it regardless of what happens below.
@@ -668,7 +756,6 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         if num_external_tokens > 0 and self._try_splice_prefetch(
             request, blocks, num_external_tokens
         ):
-            self._release_prefetch(request.request_id)
             return
         # Prefetch either doesn't exist, isn't ready, or covers none of
         # what's needed this step (a partial cover was already spliced and
@@ -684,9 +771,64 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
 
     def _build_store_jobs(self, scheduler_output: SchedulerOutput):
         store_jobs = super()._build_store_jobs(scheduler_output)
-        for job_id in store_jobs:
-            self._pending_job_keys[job_id] = list(self._jobs[job_id].keys)
+        # A probe layer belongs to one KV group. Until worker metadata carries
+        # that group explicitly, fail closed for hybrid/multi-group models.
+        if len(self.config.kv_group_configs) != 1:
+            return store_jobs
+        blocks_per_chunk = config_blocks_per_chunk(self.config)
+        for job_id, job in store_jobs.items():
+            status = self._jobs[job_id]
+            key_cpu_blocks: dict[OffloadKey, int] = {}
+            for key in status.keys:
+                block = self.manager._policy.get(key)
+                if block is not None:
+                    key_cpu_blocks[key] = block.block_id
+            layout = build_store_job_layout(
+                key_cpu_blocks,
+                job.dst_spec.block_ids,
+                job.src_spec.block_ids,
+                blocks_per_chunk,
+            )
+            if layout is None:
+                # Sliding-window holes cannot be reconstructed from the
+                # flattened source list. Guessing would corrupt identities.
+                debug_print(
+                    f"SEMANTIC_STORE_LAYOUT_SKIPPED job={job_id} "
+                    f"keys={len(key_cpu_blocks)} "
+                    f"src_blocks={len(job.src_spec.block_ids)} "
+                    f"blocks_per_chunk={blocks_per_chunk}"
+                )
+                continue
+            self._pending_job_blocks[job_id] = layout
         return store_jobs
+
+    def reset_cache(self) -> None:
+        """Reset semantic and speculative state alongside the base cache."""
+        for state in self._prefetched.values():
+            job_status = self._jobs.get(state.job_id)
+            if job_status is not None and job_status.pending_count > 0:
+                self._reset_prefetch_releases[state.job_id] = (
+                    state.gpu_block_ids,
+                    job_status.pending_count,
+                )
+            else:
+                self._free_prefetch_blocks(state.gpu_block_ids)
+                self._prefetch_reserved_blocks -= len(state.gpu_block_ids)
+        self._prefetched.clear()
+        self._preempted_pending.clear()
+        # Splices not yet sent to workers can be released immediately. Sent
+        # splices remain quarantined in _pending_splice_releases until acked.
+        for splice_id, (src_ids, _dst_ids) in self._pending_splice_jobs.items():
+            pending = self._pending_splice_releases.pop(splice_id, None)
+            block_ids = pending[0] if pending is not None else src_ids
+            self._free_prefetch_blocks(block_ids)
+            self._prefetch_reserved_blocks -= len(block_ids)
+        self._pending_splice_jobs.clear()
+        self._current_batch_prefetch_load_jobs.clear()
+        self._pending_job_keys.clear()
+        self._pending_job_blocks.clear()
+        self._worker_reset_pending = True
+        super().reset_cache()
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -705,6 +847,8 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         assert isinstance(base_meta, OffloadingConnectorMetadata)
         job_keys = self._pending_job_keys
         self._pending_job_keys = {}
+        job_blocks = self._pending_job_blocks
+        self._pending_job_blocks = {}
         splice_jobs = self._pending_splice_jobs
         self._pending_splice_jobs = {}
         prefetch_load_jobs = self._current_batch_prefetch_load_jobs
@@ -712,14 +856,18 @@ class SemanticOffloadingConnectorScheduler(OffloadingConnectorScheduler):
         evicted_keys: list[OffloadKey] = []
         if hasattr(self.manager, "drain_evicted_keys"):
             evicted_keys = self.manager.drain_evicted_keys()
+        reset_semantic_state = self._worker_reset_pending
+        self._worker_reset_pending = False
         return SemanticOffloadingConnectorMetadata(
             load_jobs=base_meta.load_jobs,
             store_jobs=base_meta.store_jobs,
             jobs_to_flush=base_meta.jobs_to_flush,
             store_job_keys=job_keys,
+            store_job_blocks=job_blocks,
             splice_jobs=splice_jobs,
             prefetch_load_jobs=prefetch_load_jobs,
             evicted_keys=evicted_keys,
+            reset_semantic_state=reset_semantic_state,
         )
 
 
@@ -778,11 +926,11 @@ class SemanticOffloadingConnector(OffloadingConnector):
                 SemanticOffloadingConnectorWorker, spec, kv_cache_config
             )
 
-    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         if isinstance(self.connector_scheduler, SemanticOffloadingConnectorScheduler):
             self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
 
-    def on_request_preempted(self, request: "Request") -> None:
+    def on_request_preempted(self, request: Request) -> None:
         # The core scheduler calls this on the top-level connector (this
         # class), not on connector_scheduler directly -- same delegation
         # requirement as bind_gpu_block_pool above. Missing this the first
@@ -799,6 +947,12 @@ class SemanticOffloadingConnector(OffloadingConnector):
             connector_metadata, SemanticOffloadingConnectorMetadata
         ):
             worker = self.connector_worker.worker
+            if connector_metadata.reset_semantic_state and hasattr(
+                worker, "reset_semantic_state"
+            ):
+                worker.reset_semantic_state()
+            if hasattr(worker, "receive_job_blocks"):
+                worker.receive_job_blocks(connector_metadata.store_job_blocks)
             if hasattr(worker, "receive_job_keys"):
                 worker.receive_job_keys(connector_metadata.store_job_keys)
             if hasattr(worker, "receive_evicted_keys"):
@@ -809,8 +963,11 @@ class SemanticOffloadingConnector(OffloadingConnector):
                 # reload the same keys -- but a spliced request has none,
                 # since _try_splice_prefetch substitutes for the normal
                 # load path entirely rather than running alongside it).
-                for src_ids, dst_ids in connector_metadata.splice_jobs.values():
-                    worker.splice_gpu_blocks(src_ids, dst_ids)
+                for splice_id, (
+                    src_ids,
+                    dst_ids,
+                ) in connector_metadata.splice_jobs.items():
+                    worker.splice_gpu_blocks(src_ids, dst_ids, splice_id=splice_id)
         super().bind_connector_metadata(connector_metadata)
 
     def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
@@ -820,7 +977,12 @@ class SemanticOffloadingConnector(OffloadingConnector):
         scores: RelevanceScores = {}
         if hasattr(worker, "pop_pending_scores"):
             scores = worker.pop_pending_scores()
-        if not scores:
+        completed_splices = {}
+        if hasattr(worker, "pop_completed_splices"):
+            completed_splices = {
+                splice_id: 1 for splice_id in worker.pop_completed_splices()
+            }
+        if not scores and not completed_splices:
             return base_meta
         base_meta = base_meta or OffloadingWorkerMetadata()
         assert isinstance(base_meta, OffloadingWorkerMetadata)
@@ -828,6 +990,7 @@ class SemanticOffloadingConnector(OffloadingConnector):
             completed_jobs=base_meta.completed_jobs,
             transfer_stats=base_meta.transfer_stats,
             pending_scores=scores,
+            completed_splices=completed_splices,
         )
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
@@ -843,4 +1006,8 @@ class SemanticOffloadingConnector(OffloadingConnector):
                 _t_ur = time.perf_counter() if _TIMING else 0.0
                 manager.update_relevance(scores)
                 if _TIMING:
+                    record_count(
+                        "scheduler_relevance_entries",
+                        sum(len(values) for values in manager.relevance_ema.values()),
+                    )
                     record_timing("update_relevance", time.perf_counter() - _t_ur)

@@ -12,19 +12,17 @@ Step 1.1.
 from collections.abc import Collection
 
 from typing_extensions import override
-
-from semantic_offload.policy import SemanticPolicy
 from vllm.v1.kv_offload.base import OffloadKey, PrepareStoreOutput, ReqContext
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
+from semantic_offload.policy import SemanticPolicy
+
 _EMA_ALPHA = 0.3  # ceiling weight on the newest observation; see update_relevance
 _EMA_RANK_POWER = 1.0  # unturned, like _DEFAULT_ALPHA below
-# minmax was the strongest per-KV-head scoring method in the real needle
-# test (issues log entry #9: rank 2/580 for the answer-critical block, vs.
-# cuboid_mean's 1/580 and mean's 73/580) -- picking minmax over cuboid_mean
-# here is not yet A/B'd against cuboid_mean for eviction quality specifically,
-# just carried over as "best observed ranking signal so far."
-_DEFAULT_METHOD = "minmax"
+# Mean is the strongest current live eviction result (5/6 needle-v2 cells,
+# versus 2/6 for minmax) and the strongest offline adversarial signal. Keep
+# every method selectable so the DGX audit can continue testing this default.
+_DEFAULT_METHOD = "mean"
 _DEFAULT_ALPHA = 0.5  # unturned; plan's Step 1.4 explicitly warns against 1.0.
 # A diagnostic run at alpha=0.95 gave an identical outcome to 0.5 (issues log
 # entry #10) -- the real bottleneck there was a timing/cold-start issue
@@ -103,6 +101,11 @@ class SemanticOffloadingManager(CPUOffloadingManager):
         self._pending_evicted_keys = []
         return keys
 
+    @override
+    def reset_cache(self) -> None:
+        super().reset_cache()
+        self._pending_evicted_keys.clear()
+
     def update_relevance(
         self, scores: dict[str, dict[str, list[tuple[OffloadKey, float]]]]
     ) -> None:
@@ -136,6 +139,11 @@ class SemanticOffloadingManager(CPUOffloadingManager):
                 n = len(ranked)
                 denom = max(n - 1, 1)
                 for rank, (key, new_score) in enumerate(ranked):
+                    # Worker metadata can arrive after a key was evicted or
+                    # after reset. Never resurrect stale relevance state.
+                    policy = getattr(self, "_policy", None)
+                    if policy is not None and policy.get(key) is None:
+                        continue
                     frac = rank / denom  # 0.0 = this query's top pick
                     weight = _EMA_ALPHA * (1.0 - frac) ** _EMA_RANK_POWER
                     prev = ema.get(key)

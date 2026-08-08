@@ -127,6 +127,17 @@ def scheduler_being_loaded_set(scheduler):
     return scheduler._blocks_being_loaded
 
 
+def set_next_stored_chunk_idx(group_state, value: int) -> None:
+    """Set the renamed request-group offload progress field safely."""
+    if hasattr(group_state, "next_stored_chunk_idx"):
+        group_state.next_stored_chunk_idx = value
+        return
+    if hasattr(group_state, "next_stored_block_idx"):
+        group_state.next_stored_block_idx = value
+        return
+    raise AttributeError("request group state has no stored-chunk progress field")
+
+
 def init_cpu_offloading_worker_base(
     worker, kv_caches, blocks_per_chunk, num_cpu_blocks
 ):

@@ -9,9 +9,21 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
+
+
+def resolve_vllm_cli() -> str:
+    """Resolve the vLLM CLI from the selected Python environment."""
+    explicit = os.environ.get("VLLM_CLI")
+    if explicit:
+        return explicit
+    sibling = os.path.join(os.path.dirname(sys.executable), "vllm")
+    return (
+        sibling if os.path.isfile(sibling) and os.access(sibling, os.X_OK) else "vllm"
+    )
 
 
 class ServerHandle:
@@ -83,7 +95,7 @@ def launch_server(
     )
 
     cmd = [
-        "vllm",
+        resolve_vllm_cli(),
         "serve",
         model,
         "--port",

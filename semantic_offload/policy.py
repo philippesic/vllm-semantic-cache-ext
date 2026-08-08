@@ -18,13 +18,14 @@ for freshly-inserted, as-yet-unscored blocks).
 """
 
 from collections.abc import Iterable
+from itertools import pairwise
 
 from typing_extensions import override
-
-from semantic_offload._debug import debug_print
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+
+from semantic_offload._debug import debug_print
 
 # How often (in touch() calls with session_aware on) to print the
 # SEMANTIC_SESSION_DEBUG growth line -- issues log entry #70's open question
@@ -49,7 +50,7 @@ class SemanticPolicy(CachePolicy):
         self,
         cache_capacity: int,
         relevance_ema: dict[str, dict[OffloadKey, float]] | None = None,
-        method: str = "minmax",
+        method: str = "mean",
         alpha: float = 0.5,
         grace_window_blocks: int = 0,
         mode: str = "blend",
@@ -108,6 +109,7 @@ class SemanticPolicy(CachePolicy):
         # for this slice.
         self._chain_aware = chain_aware
         self._chain_successor: dict[OffloadKey, OffloadKey] = {}
+        self._chain_predecessors: dict[OffloadKey, set[OffloadKey]] = {}
         # Session-proven priority (issues log entry #19's follow-up, after
         # the per-block chain-successor bonus above was found redundant with
         # LRU's own touch() semantics and closed). Targets a different gap
@@ -171,21 +173,46 @@ class SemanticPolicy(CachePolicy):
     @override
     def remove(self, key: OffloadKey) -> None:
         self._lru.remove(key)
+        self._forget_key(key)
+
+    def _forget_key(self, key: OffloadKey) -> None:
+        """Drop all policy metadata owned by a no-longer-resident key."""
         self._grace_expiry.pop(key, None)
-        self._chain_successor.pop(key, None)
+        successor = self._chain_successor.pop(key, None)
+        if successor is not None:
+            predecessors = self._chain_predecessors.get(successor)
+            if predecessors is not None:
+                predecessors.discard(key)
+                if not predecessors:
+                    self._chain_predecessors.pop(successor, None)
+        for predecessor in self._chain_predecessors.pop(key, ()):
+            if self._chain_successor.get(predecessor) == key:
+                self._chain_successor.pop(predecessor, None)
         self._last_touch_req_id.pop(key, None)
         self._session_proven.discard(key)
         self._last_touch_seq.pop(key, None)
+        for scores in self._relevance_ema.values():
+            scores.pop(key, None)
 
     @override
     def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
-        self._lru.touch(keys, req_context)
+        # CachePolicy accepts any iterable, including one-shot generators.
+        # Materialize once so the delegate and semantic metadata see the
+        # same keys.
+        ordered = list(keys)
+        self._lru.touch(ordered, req_context)
         if self._chain_aware:
-            ordered = list(keys)
-            for prev_key, next_key in zip(ordered, ordered[1:]):
+            for prev_key, next_key in pairwise(ordered):
+                old_successor = self._chain_successor.get(prev_key)
+                if old_successor is not None and old_successor != next_key:
+                    predecessors = self._chain_predecessors.get(old_successor)
+                    if predecessors is not None:
+                        predecessors.discard(prev_key)
+                        if not predecessors:
+                            self._chain_predecessors.pop(old_successor, None)
                 self._chain_successor[prev_key] = next_key
+                self._chain_predecessors.setdefault(next_key, set()).add(prev_key)
         if self._session_aware:
-            ordered = list(keys)
             req_id = req_context.req_id
             cross_request_hit = any(
                 self._last_touch_req_id.get(k) not in (None, req_id) for k in ordered
@@ -324,6 +351,7 @@ class SemanticPolicy(CachePolicy):
         chosen = scored[:n]
         for _, key, _ in chosen:
             self._lru.remove(key)
+            self._forget_key(key)
         return [(key, block) for _, key, block in chosen]
 
     def _evict_unscored_last(
@@ -342,11 +370,23 @@ class SemanticPolicy(CachePolicy):
         chosen = (unscored + rest)[:n]
         for key, _ in chosen:
             self._lru.remove(key)
+            self._forget_key(key)
         return chosen
 
     @override
     def clear(self) -> None:
         self._lru.clear()
+        self._grace_expiry.clear()
+        self._chain_successor.clear()
+        self._chain_predecessors.clear()
+        self._last_touch_req_id.clear()
+        self._session_proven.clear()
+        self._last_touch_seq.clear()
+        self._insert_count = 0
+        self._touch_seq = 0
+        self._session_touch_calls = 0
+        for scores in self._relevance_ema.values():
+            scores.clear()
 
     @override
     def mark_evictable(self, key: OffloadKey) -> None:

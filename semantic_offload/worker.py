@@ -39,15 +39,25 @@ summaries. Does not apply to MLA (no per-head keys exist there at all).
 """
 
 import itertools
+import re
 import time
 
 import torch
+from vllm.config import VllmConfig
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCaches,
+    GPULoadStoreSpec,
+    LoadStoreSpec,
+    OffloadKey,
+)
+from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 
 from semantic_offload._debug import TIMING as _TIMING
 from semantic_offload._debug import (
     debug_print,
     record_count,
     record_gpu_memory,
+    record_process_state,
     record_timing,
 )
 from semantic_offload._vllm_compat import init_cpu_offloading_worker_base
@@ -59,16 +69,9 @@ from semantic_offload.index import (
     score_minmax_batch,
 )
 from semantic_offload.query_capture import install as install_query_capture
-from vllm.config import VllmConfig
-from vllm.v1.kv_offload.base import (
-    CanonicalKVCaches,
-    GPULoadStoreSpec,
-    LoadStoreSpec,
-    OffloadKey,
-)
-from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 
 _SCORING_METHODS = ("minmax", "mean", "cuboid_mean")
+_HEAD_AGGREGATIONS = ("mean", "max")
 # Which BlockSummary fields each method's batched scorer actually needs --
 # only these get stacked into the cache, not all four.
 _METHOD_FIELDS = {
@@ -78,6 +81,38 @@ _METHOD_FIELDS = {
 }
 
 
+def select_probe_layer(layer_names, selection: str | int = "middle") -> str | None:
+    """Select a probe layer by natural model order or exact name."""
+    names = list(layer_names)
+    if not names:
+        return None
+
+    def natural_key(name: str):
+        return tuple(
+            (1, int(part)) if part.isdigit() else (0, part)
+            for part in re.split(r"(\d+)", name)
+        )
+
+    ordered = sorted(names, key=natural_key)
+    if selection in names:
+        return str(selection)
+    if isinstance(selection, int) or str(selection).lstrip("-").isdigit():
+        index = int(selection)
+        try:
+            return ordered[index]
+        except IndexError as exc:
+            raise ValueError(
+                f"probe_layer index {index} outside 0..{len(ordered) - 1}"
+            ) from exc
+    positions = {"first": 0, "middle": len(ordered) // 2, "last": -1}
+    if selection not in positions:
+        raise ValueError(
+            f"Unknown probe_layer {selection!r}; use first/middle/last, "
+            "an integer index, or an exact layer name"
+        )
+    return ordered[positions[str(selection)]]
+
+
 class SemanticOffloadingWorker(CPUOffloadingWorker):
     def __init__(
         self,
@@ -85,8 +120,10 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         blocks_per_chunk: int,
         num_cpu_blocks: int,
         vllm_config: VllmConfig,
-        method: str = "minmax",
+        method: str = "mean",
         capture_stride: int = 1,
+        probe_layer: str | int = "middle",
+        head_aggregation: str = "mean",
     ):
         # CPUOffloadingWorker's own param is named block_size_factor or
         # blocks_per_chunk depending on the installed vLLM's version
@@ -104,6 +141,14 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
                 f"Unknown scoring method: {method!r}. Supported: {_SCORING_METHODS}"
             )
         self._method = method
+        if capture_stride < 1:
+            raise ValueError("capture_stride must be >= 1")
+        if head_aggregation not in _HEAD_AGGREGATIONS:
+            raise ValueError(
+                f"Unknown head_aggregation: {head_aggregation!r}. "
+                f"Supported: {_HEAD_AGGREGATIONS}"
+            )
+        self._head_aggregation = head_aggregation
         static_forward_context = vllm_config.compilation_config.static_forward_context
         self._attention_layers = {
             layer_name: layer
@@ -125,10 +170,11 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
 
         # Step 1.3: durable, OffloadKey-keyed summaries (survive GPU block
         # reuse, unlike `self.summaries` above) + live query scoring.
-        # One probe layer only, per the plan -- picked deterministically so
-        # it's stable across process restarts, not for any semantic reason.
-        self._probe_layer_name = (
-            min(self._attention_layers) if self._attention_layers else None
+        # Mid-model was used by the experiments that selected the current
+        # scoring method. Keep the position configurable for controlled DGX
+        # ablations and exact-name overrides.
+        self._probe_layer_name = select_probe_layer(
+            self._attention_layers, selection=probe_layer
         )
         # One BlockSummary per KV head (not averaged across heads -- see
         # issues log entry #9; entry #7's pooled-average version is
@@ -149,6 +195,7 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         self._max_durable_summaries = max(num_cpu_blocks, 1)
         self.durable_summaries: dict[OffloadKey, list[BlockSummary]] = {}
         self._pending_job_keys: dict[int, list[OffloadKey]] = {}
+        self._pending_job_blocks: dict[int, list[tuple[OffloadKey, list[int]]]] = {}
         self._pending_scores: dict[str, dict[str, list[tuple[OffloadKey, float]]]] = {}
         # Cache of durable_summaries stacked into batched tensors, kept in
         # sync incrementally (see _rebuild_stack_cache) rather than rebuilt
@@ -164,6 +211,9 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         self._stack_cache_index: dict[OffloadKey, int] = {}
         self._stack_pending_insert: set[OffloadKey] = set()
         self._stack_pending_remove: set[OffloadKey] = set()
+        # splice_id -> completion event. The scheduler keeps speculative
+        # source blocks reserved until every worker reports this event done.
+        self._splice_events: dict[int, torch.cuda.Event | None] = {}
         self._query_capture_mode = None
         if self._probe_layer_name is not None:
             probe_layer = self._attention_layers[self._probe_layer_name]
@@ -171,6 +221,10 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
                 vllm_config.parallel_config
             )
             num_queries_per_kv = num_attn_heads // probe_layer.num_kv_heads
+            if num_attn_heads % probe_layer.num_kv_heads:
+                raise ValueError(
+                    "attention heads must be divisible by KV heads for query capture"
+                )
             self._query_capture_mode = install_query_capture(
                 vllm_config,
                 self._probe_layer_name,
@@ -185,6 +239,32 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         job_id represents (scheduler-side info the worker has no other way
         to see -- see connector.py and the issues log entry #6/7)."""
         self._pending_job_keys.update(store_job_keys)
+
+    def receive_job_blocks(
+        self,
+        store_job_blocks: dict[int, list[tuple[OffloadKey, list[int]]]],
+    ) -> None:
+        """Receive an exact key-to-source-block layout for each store job."""
+        self._pending_job_blocks.update(store_job_blocks)
+
+    def reset_semantic_state(self) -> None:
+        """Drop worker state whose identities belong to the old CPU cache."""
+        if self._summary_stream is not None:
+            # Reset is rare and destructive. Do not drop the last references
+            # to tensors whose reductions are still running on the side stream.
+            self._summary_stream.synchronize()
+        for summaries in self.summaries.values():
+            summaries.clear()
+        self.durable_summaries.clear()
+        self._pending_job_keys.clear()
+        self._pending_job_blocks.clear()
+        self._pending_scores.clear()
+        self._stack_cache_dirty = True
+        self._stack_cache_keys.clear()
+        self._stack_cache.clear()
+        self._stack_cache_index.clear()
+        self._stack_pending_insert.clear()
+        self._stack_pending_remove.clear()
 
     def receive_evicted_keys(self, evicted_keys: list[OffloadKey]) -> None:
         """Called by SemanticOffloadingConnector with exactly the keys the
@@ -301,6 +381,11 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
     def _on_queries_captured(self, req_ids: list[str], queries: torch.Tensor) -> None:
         if not self.durable_summaries or not req_ids:
             return
+        _t_call = time.perf_counter() if _TIMING else 0.0
+        if self._summary_stream is not None:
+            # Durable tensors are produced on the summary stream. Scoring on
+            # the model stream must not observe partially-written reductions.
+            torch.cuda.current_stream().wait_stream(self._summary_stream)
         # 2026-08-01: test whether query_captured_total's per-call cost
         # growth (07-30/08-01 handoffs, rag@8.0) tracks batch size rather
         # than resident-pool size -- resident= stayed flat in the last
@@ -311,11 +396,12 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         if _TIMING:
             record_count("query_captured_batch_size", len(req_ids))
             record_count("query_captured_resident_pool", len(self.durable_summaries))
+            record_count("query_captured_pending_scores", len(self._pending_scores))
             # 2026-08-02: allocator-fragmentation theory (08-02 handoff) --
             # snapshot GPU allocator counters on the same cadence to correlate
             # with query_captured_total's per-call cost climb.
             record_gpu_memory("query_captured")
-        _t_call = time.perf_counter() if _TIMING else 0.0
+            record_process_state("query_captured")
         # queries: [n_reqs, num_kv_heads, head_dim] -- one row per request
         # scheduled in this step. All concurrent requests are scored in ONE
         # batched pass with ONE GPU sync per step, instead of one pass-plus-
@@ -371,16 +457,18 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
             per_head = score_mean_batch(query, cache["mean"])
         else:  # cuboid_mean
             per_head = score_cuboid_mean_batch(query, cache["mean"], cache["mad"])
-        # Per-head score, combined via max across heads -- different KV
-        # heads may specialize on different content, so the head most
-        # aligned with this query should drive the block's relevance
-        # (entry #9). One sync for the whole step's batch (.tolist()), not
-        # one per request or per candidate.
+        # Combine KV heads before the one CPU/GPU synchronization. Mean is
+        # the current evidence-backed default; max remains an audit arm.
         _t_sync = time.perf_counter() if _TIMING else 0.0
         # [n_reqs, n_candidates] -> list of per-request score lists.
-        all_scores = per_head.max(dim=-1).values.tolist()
+        if self._head_aggregation == "mean":
+            combined = per_head.mean(dim=-1)
+        else:
+            combined = per_head.max(dim=-1).values
+        all_scores = combined.tolist()
         if _TIMING:
             record_timing("query_captured_sync", time.perf_counter() - _t_sync)
+        _t_rank = time.perf_counter() if _TIMING else 0.0
         method_scores = self._pending_scores.setdefault(self._method, {})
         for req_id, scores in zip(req_ids, all_scores):
             ranked = sorted(zip(keys, scores), key=lambda kv: kv[1], reverse=True)
@@ -392,6 +480,7 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
                 f"scores={[round(s, 4) for _, s in ranked]}"
             )
         if _TIMING:
+            record_timing("query_rank_metadata", time.perf_counter() - _t_rank)
             record_timing("query_captured_total", time.perf_counter() - _t_call)
 
     def _check_layout(self, layer_name: str, layer, kv_cache: torch.Tensor) -> None:
@@ -479,16 +568,49 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
             f"SEMANTIC_STEP1_3_DEBUG store job={job_id} "
             f"keys={[k.hex()[:8] for k in keys]} block_ids={list(block_ids)}"
         )
-        if len(block_summaries) == len(keys):
-            for key, summary in zip(keys, block_summaries):
-                self.durable_summaries[key] = summary
-        else:
-            # Can't establish precise per-block correspondence for this job;
-            # fall back to the job's most-recent block as a best-effort
-            # proxy for all of its keys rather than dropping the signal.
-            for key in keys:
-                self.durable_summaries[key] = block_summaries[-1]
+        if len(block_summaries) != len(keys):
+            debug_print(
+                f"SEMANTIC_STORE_LAYOUT_SKIPPED job={job_id} "
+                f"keys={len(keys)} blocks={len(block_summaries)}"
+            )
+            return
+        for key, summary in zip(keys, block_summaries):
+            self.durable_summaries[key] = summary
         self._mark_inserted_into_stack_cache(keys)
+        pruned = self._prune_durable_summaries()
+        if pruned:
+            self._mark_removed_from_stack_cache(pruned)
+
+    def _build_durable_summaries_for_job(self, job_id: int) -> None:
+        """Build summaries using an explicit key-to-GPU-block layout."""
+        layout = self._pending_job_blocks.pop(job_id, None)
+        if not layout or self._probe_layer_name is None:
+            return
+        layer = self._attention_layers.get(self._probe_layer_name)
+        if layer is None:
+            return
+        kv_cache = getattr(layer, "kv_cache", None)
+        if kv_cache is None or kv_cache.numel() == 0:
+            return
+        self._check_layout(self._probe_layer_name, layer, kv_cache)
+        head_size = layer.head_size
+        inserted: list[OffloadKey] = []
+        for key, block_ids in layout:
+            if not block_ids:
+                continue
+            block_idx = torch.as_tensor(
+                block_ids, device=kv_cache.device, dtype=torch.long
+            )
+            # [blocks, heads, tokens, dim] -> [heads, blocks*tokens, dim]
+            keys = kv_cache.index_select(0, block_idx)[..., :head_size].float()
+            keys = keys.permute(1, 0, 2, 3).reshape(keys.shape[1], -1, head_size)
+            self.durable_summaries[key] = [
+                build_summary(keys[head]) for head in range(keys.shape[0])
+            ]
+            inserted.append(key)
+        if not inserted:
+            return
+        self._mark_inserted_into_stack_cache(inserted)
         pruned = self._prune_durable_summaries()
         if pruned:
             self._mark_removed_from_stack_cache(pruned)
@@ -515,11 +637,31 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
     def submit_store(
         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
     ) -> bool:
-        self._build_summaries_for_blocks(job_id, src_spec.block_ids)
+        if job_id in self._pending_job_blocks:
+            if self._summary_stream is not None:
+                current_stream = torch.cuda.current_stream()
+                with torch.cuda.stream(self._summary_stream):
+                    self._summary_stream.wait_stream(current_stream)
+                    self._build_durable_summaries_for_job(job_id)
+            else:
+                self._build_durable_summaries_for_job(job_id)
+        else:
+            # Legacy metadata remains exact only for one-block-per-key jobs.
+            self._build_summaries_for_blocks(job_id, src_spec.block_ids)
+        if self._summary_stream is not None:
+            # The base GPU->CPU transfer stream waits on the current model
+            # stream. Make that dependency transitively include the summary
+            # stream before the store can complete and its source block can
+            # be reused for unrelated KV contents.
+            torch.cuda.current_stream().wait_stream(self._summary_stream)
         return super().submit_store(job_id, src_spec, dst_spec)
 
     def splice_gpu_blocks(
-        self, src_block_ids: list[int], dst_block_ids: list[int]
+        self,
+        src_block_ids: list[int],
+        dst_block_ids: list[int],
+        *,
+        splice_id: int | None = None,
     ) -> None:
         """Step 1.5: copy already-GPU-resident block content from
         `src_block_ids` to `dst_block_ids`, across every attention layer --
@@ -543,6 +685,7 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         if not src_block_ids or not dst_block_ids:
             return
         assert len(src_block_ids) == len(dst_block_ids)
+        copied_on_cuda = False
         for layer in self._attention_layers.values():
             kv_cache = getattr(layer, "kv_cache", None)
             if kv_cache is None or kv_cache.numel() == 0:
@@ -554,3 +697,25 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
                 dst_block_ids, device=kv_cache.device, dtype=torch.long
             )
             kv_cache.index_copy_(0, dst_idx, kv_cache.index_select(0, src_idx))
+            copied_on_cuda = copied_on_cuda or kv_cache.is_cuda
+        if splice_id is not None:
+            events = getattr(self, "_splice_events", None)
+            if events is None:
+                events = self._splice_events = {}
+            event = None
+            if copied_on_cuda:
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream())
+            events[splice_id] = event
+
+    def pop_completed_splices(self) -> list[int]:
+        """Return splice IDs whose source blocks are safe to release."""
+        events = getattr(self, "_splice_events", {})
+        completed = [
+            splice_id
+            for splice_id, event in events.items()
+            if event is None or event.query()
+        ]
+        for splice_id in completed:
+            del events[splice_id]
+        return completed

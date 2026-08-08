@@ -8,22 +8,27 @@ and the issues log for that investigation).
 
 import pytest
 import torch
+from vllm.v1.kv_offload.base import make_offload_key
+
 from semantic_offload.index import BlockSummary, score
 from semantic_offload.manager import SemanticOffloadingManager
 from semantic_offload.worker import SemanticOffloadingWorker
 
-from vllm.v1.kv_offload.base import make_offload_key
 
-
-def _make_worker(method: str = "minmax") -> SemanticOffloadingWorker:
+def _make_worker(
+    method: str = "minmax", head_aggregation: str = "max"
+) -> SemanticOffloadingWorker:
     worker = SemanticOffloadingWorker.__new__(SemanticOffloadingWorker)
     worker._probe_layer_name = "layer0"
+    worker._summary_stream = None
     worker.summaries = {"layer0": {}}
     worker._pending_job_keys = {}
+    worker._pending_job_blocks = {}
     worker.durable_summaries = {}
     worker._max_durable_summaries = 10_000  # effectively unbounded for these tests
     worker._pending_scores = {}
     worker._method = method
+    worker._head_aggregation = head_aggregation
     worker._stack_cache_dirty = True
     worker._stack_cache_keys = []
     worker._stack_cache = {}
@@ -71,10 +76,8 @@ def test_durably_key_summaries_aligned_job():
         assert torch.allclose(head_summary.mean, torch.full((4,), 2.0))
 
 
-def test_durably_key_summaries_mismatched_length_uses_fallback():
-    """3 blocks, 1 key (e.g. a job that bundled multiple blocks under one
-    key due to grouping) -- falls back to the most-recent block's summary
-    rather than dropping the signal or crashing."""
+def test_durably_key_summaries_mismatched_length_is_skipped():
+    """An ambiguous legacy layout must never guess a key identity."""
     worker = _make_worker()
     worker.summaries["layer0"][1] = [_summary(1.0)]
     worker.summaries["layer0"][2] = [_summary(2.0)]
@@ -84,8 +87,7 @@ def test_durably_key_summaries_mismatched_length_uses_fallback():
 
     worker._durably_key_summaries(5, [1, 2, 3])
 
-    for head_summary in worker.durable_summaries[key]:
-        assert torch.allclose(head_summary.mean, torch.full((4,), 3.0))
+    assert key not in worker.durable_summaries
 
 
 def test_durably_key_summaries_no_job_keys_is_noop():
@@ -414,3 +416,71 @@ def test_update_relevance_rank_weighting_protects_top_ranked_key():
         "needle's EMA collapsed toward the distractor floor -- rank weighting "
         f"should have barely touched a last-ranked key, got {needle_score}"
     )
+
+
+def test_head_aggregation_is_configurable():
+    key = to_key(50)
+    summaries = [
+        _summary(10.0),
+        _summary(-2.0),
+    ]
+    query = torch.ones(2, 4)
+    max_worker = _make_worker(method="mean", head_aggregation="max")
+    mean_worker = _make_worker(method="mean", head_aggregation="mean")
+    _seed_durable_summaries(max_worker, {key: summaries})
+    _seed_durable_summaries(mean_worker, {key: summaries})
+
+    max_worker._on_query_captured("req", query)
+    mean_worker._on_query_captured("req", query)
+
+    max_score = max_worker.pop_pending_scores()["mean"]["req"][0][1]
+    mean_score = mean_worker.pop_pending_scores()["mean"]["req"][0][1]
+    assert max_score == pytest.approx(40.0)
+    assert mean_score == pytest.approx(16.0)
+
+
+def test_worker_reset_clears_all_keyed_state():
+    worker = _make_worker(method="mean")
+    key = to_key(60)
+    _seed_durable_summaries(worker, {key: [_summary(1.0)]})
+    worker._pending_job_keys[1] = [key]
+    worker._pending_job_blocks[1] = [(key, [0])]
+    worker._pending_scores = {"mean": {"req": [(key, 1.0)]}}
+    worker._rebuild_stack_cache()
+
+    worker.reset_semantic_state()
+
+    assert worker.durable_summaries == {}
+    assert worker._pending_job_keys == {}
+    assert worker._pending_job_blocks == {}
+    assert worker._pending_scores == {}
+    assert worker._stack_cache_keys == []
+    assert worker._stack_cache == {}
+
+
+def test_worker_reset_synchronizes_summary_stream_before_clearing():
+    from unittest.mock import Mock
+
+    worker = _make_worker(method="mean")
+    stream = Mock()
+    worker._summary_stream = stream
+
+    worker.reset_semantic_state()
+
+    stream.synchronize.assert_called_once_with()
+
+
+def test_delayed_score_does_not_resurrect_evicted_key():
+    from vllm.v1.kv_offload.base import ReqContext
+
+    manager = SemanticOffloadingManager(num_blocks=1, method="mean")
+    old_key, new_key = to_key(70), to_key(71)
+    output = manager.prepare_store([old_key], ReqContext(req_id="old"))
+    assert output is not None
+    manager.complete_store([old_key], ReqContext(req_id="old"))
+    output = manager.prepare_store([new_key], ReqContext(req_id="new"))
+    assert output is not None and output.evicted_keys == [old_key]
+
+    manager.update_relevance({"mean": {"delayed": [(old_key, 99.0)]}})
+
+    assert old_key not in manager.relevance_ema.get("mean", {})

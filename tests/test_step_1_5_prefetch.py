@@ -15,13 +15,9 @@ scheduler internals and is verified end-to-end on the real server instead
 from types import SimpleNamespace
 
 import torch
-from semantic_offload.connector import (
-    SemanticOffloadingConnectorScheduler,
-    _PrefetchState,
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    RequestGroupState,
 )
-from semantic_offload.manager import SemanticOffloadingManager
-from semantic_offload.worker import SemanticOffloadingWorker
-
 from vllm.v1.kv_offload.base import (
     OffloadPolicy,
     ReqContext,
@@ -30,6 +26,14 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus
 
+from semantic_offload.connector import (
+    SemanticOffloadingConnectorScheduler,
+    SemanticWorkerMetadata,
+    _PrefetchState,
+)
+from semantic_offload.manager import SemanticOffloadingManager
+from semantic_offload.worker import SemanticOffloadingWorker
+
 
 def to_key(n: int):
     return make_offload_key(str(n).encode(), 0)
@@ -37,32 +41,32 @@ def to_key(n: int):
 
 def test_top_relevant_keys_picks_highest_scored_within_budget():
     manager = SemanticOffloadingManager(num_blocks=10)
-    ema = manager.relevance_ema.setdefault("minmax", {})
+    ema = manager.relevance_ema.setdefault("mean", {})
     keys = [to_key(i) for i in range(5)]
     for i, key in enumerate(keys):
         ema[key] = float(i)  # key i has score i -- key 4 highest
 
-    top = manager.top_relevant_keys(keys, k=2, method="minmax")
+    top = manager.top_relevant_keys(keys, k=2, method="mean")
 
     assert top == [keys[4], keys[3]]
 
 
 def test_top_relevant_keys_skips_unscored_candidates():
     manager = SemanticOffloadingManager(num_blocks=10)
-    ema = manager.relevance_ema.setdefault("minmax", {})
+    ema = manager.relevance_ema.setdefault("mean", {})
     scored, unscored = to_key(1), to_key(2)
     ema[scored] = 5.0
     # `unscored` deliberately has no entry -- a preempted request's block
     # may not have earned a score yet, and there's nothing to prefer.
 
-    top = manager.top_relevant_keys([scored, unscored], k=5, method="minmax")
+    top = manager.top_relevant_keys([scored, unscored], k=5, method="mean")
 
     assert top == [scored]
 
 
 def test_top_relevant_keys_budget_zero_returns_nothing():
     manager = SemanticOffloadingManager(num_blocks=10)
-    manager.relevance_ema.setdefault("minmax", {})[to_key(1)] = 1.0
+    manager.relevance_ema.setdefault("mean", {})[to_key(1)] = 1.0
 
     assert manager.top_relevant_keys([to_key(1)], k=0, method="minmax") == []
 
@@ -123,6 +127,16 @@ def test_splice_gpu_blocks_mismatched_lengths_raises():
     assert raised
 
 
+def test_splice_completion_is_reported_once_after_cpu_copy():
+    layer = _make_layer(4, 1, 4, 8, seed=5)
+    worker = _make_worker({"layer0": layer})
+
+    worker.splice_gpu_blocks([0], [2], splice_id=17)
+
+    assert worker.pop_completed_splices() == [17]
+    assert worker.pop_completed_splices() == []
+
+
 class _StubBlockPool:
     """Minimal stand-in for vllm's real BlockPool -- only the surface
     _attempt_prefetch_reservation actually touches. get_new_blocks() mirrors
@@ -134,6 +148,9 @@ class _StubBlockPool:
     def __init__(self, num_gpu_blocks: int, free_blocks: int):
         self.num_gpu_blocks = num_gpu_blocks
         self._free = free_blocks
+        self.blocks = [
+            SimpleNamespace(block_id=block_id) for block_id in range(num_gpu_blocks)
+        ]
         # Real BlockPool reserves block_id 0 as a null block, never handed
         # out for real content -- start at 1 to match, since production
         # code filters `bid != 0` when recording allocated block ids.
@@ -147,7 +164,7 @@ class _StubBlockPool:
         self._free -= n
         blocks = []
         for _ in range(n):
-            blocks.append(SimpleNamespace(block_id=self._next_id))
+            blocks.append(self.blocks[self._next_id])
             self._next_id += 1
         return blocks
 
@@ -182,12 +199,19 @@ def _make_connector_scheduler(
     sched.gpu_block_pool = gpu_block_pool
     sched._prefetched = {}
     sched._prefetch_reserved_blocks = 0
+    sched._prefetch_budget_fraction = 0.05
     sched._preempted_pending = set()
     sched._req_status = {}
     sched._current_batch_load_jobs = {}
     sched._current_batch_prefetch_load_jobs = {}
     sched._current_batch_allocated_block_ids = set()
     sched._pending_splice_jobs = {}
+    sched._pending_splice_releases = {}
+    sched._splice_counter = 0
+    sched._pending_job_keys = {}
+    sched._pending_job_blocks = {}
+    sched._worker_reset_pending = False
+    sched._reset_prefetch_releases = {}
     sched._jobs = {}
     sched._job_counter = 0
     # Same object under both names (pre-#48150 _blocks_being_loaded, renamed
@@ -226,6 +250,71 @@ def _make_connector_scheduler(
     return sched
 
 
+def test_reset_releases_completed_prefetch_and_clears_semantic_state():
+    from unittest.mock import patch
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        OffloadingConnectorScheduler,
+    )
+
+    manager = SemanticOffloadingManager(num_blocks=10)
+    pool = _StubBlockPool(20, free_blocks=0)
+    sched = _make_connector_scheduler(manager, pool)
+    sched._prefetched["r1"] = _PrefetchState(
+        job_id=7, keys=[to_key(1)], gpu_block_ids=[3]
+    )
+    sched._prefetch_reserved_blocks = 1
+    sched._preempted_pending.add("r1")
+    sched._pending_job_blocks[9] = [(to_key(1), [2])]
+
+    with patch.object(OffloadingConnectorScheduler, "reset_cache") as base_reset:
+        sched.reset_cache()
+
+    base_reset.assert_called_once_with()
+    assert pool.get_num_free_blocks() == 1
+    assert sched._prefetched == {}
+    assert sched._prefetch_reserved_blocks == 0
+    assert sched._preempted_pending == set()
+    assert sched._pending_job_blocks == {}
+    assert sched._worker_reset_pending is True
+
+
+def test_reset_keeps_inflight_prefetch_reserved_until_transfer_completion():
+    from unittest.mock import patch
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        OffloadingConnectorScheduler,
+    )
+
+    manager = SemanticOffloadingManager(num_blocks=10)
+    pool = _StubBlockPool(20, free_blocks=0)
+    sched = _make_connector_scheduler(manager, pool)
+    sched._prefetched["r1"] = _PrefetchState(
+        job_id=7, keys=[to_key(1)], gpu_block_ids=[3]
+    )
+    sched._prefetch_reserved_blocks = 1
+    sched._jobs[7] = SimpleNamespace(pending_count=2)
+
+    with patch.object(OffloadingConnectorScheduler, "reset_cache"):
+        sched.reset_cache()
+
+    assert pool.get_num_free_blocks() == 0
+    assert sched._prefetch_reserved_blocks == 1
+    assert sched._reset_prefetch_releases == {7: ([3], 2)}
+
+    output = SimpleNamespace(
+        kv_connector_worker_meta=SemanticWorkerMetadata(completed_jobs={7: 1})
+    )
+    with patch.object(OffloadingConnectorScheduler, "update_connector_output"):
+        sched.update_connector_output(output)
+        assert pool.get_num_free_blocks() == 0
+        sched.update_connector_output(output)
+
+    assert pool.get_num_free_blocks() == 1
+    assert sched._prefetch_reserved_blocks == 0
+    assert sched._reset_prefetch_releases == {}
+
+
 def _add_req_status(
     sched,
     req_id: str,
@@ -235,7 +324,7 @@ def _add_req_status(
     policy: OffloadPolicy = OffloadPolicy.BLOCK_LEVEL,
 ) -> None:
     sched._req_status[req_id] = SimpleNamespace(
-        group_states=[SimpleNamespace(offload_keys=keys, next_stored_block_idx=0)],
+        group_states=[RequestGroupState(offload_keys=keys)],
         req_context=ReqContext(req_id=req_id),
         transfer_jobs=set(),
         num_locally_computed_tokens=num_locally_computed_tokens,
@@ -271,7 +360,7 @@ def test_attempt_prefetch_reservation_retries_when_no_free_blocks():
     manager = SemanticOffloadingManager(num_blocks=10)
     key = to_key(1)
     _insert_resident(manager, key, block_id=0)
-    manager.relevance_ema.setdefault("minmax", {})[key] = 1.0
+    manager.relevance_ema.setdefault("mean", {})[key] = 1.0
     sched = _make_connector_scheduler(manager, _StubBlockPool(20, free_blocks=0))
     _add_req_status(sched, "r1", keys=[key])
 
@@ -286,7 +375,7 @@ def test_attempt_prefetch_reservation_succeeds_once_blocks_free_up():
     manager = SemanticOffloadingManager(num_blocks=10)
     key = to_key(1)
     _insert_resident(manager, key, block_id=0)
-    manager.relevance_ema.setdefault("minmax", {})[key] = 1.0
+    manager.relevance_ema.setdefault("mean", {})[key] = 1.0
     pool = _StubBlockPool(20, free_blocks=0)
     sched = _make_connector_scheduler(manager, pool)
     _add_req_status(sched, "r1", keys=[key])
@@ -310,7 +399,7 @@ def test_successful_reservation_registers_job_in_req_status_transfer_jobs():
     manager = SemanticOffloadingManager(num_blocks=10)
     key = to_key(1)
     _insert_resident(manager, key, block_id=0)
-    manager.relevance_ema.setdefault("minmax", {})[key] = 1.0
+    manager.relevance_ema.setdefault("mean", {})[key] = 1.0
     sched = _make_connector_scheduler(manager, _StubBlockPool(20, free_blocks=5))
     _add_req_status(sched, "r1", keys=[key])
 
@@ -326,8 +415,8 @@ def test_retry_pending_prefetches_removes_only_the_succeeded_request():
     key1, key2 = to_key(1), to_key(2)
     _insert_resident(manager, key1, block_id=0)
     _insert_resident(manager, key2, block_id=1)
-    manager.relevance_ema.setdefault("minmax", {})[key1] = 1.0
-    manager.relevance_ema.setdefault("minmax", {})[key2] = 1.0
+    manager.relevance_ema.setdefault("mean", {})[key1] = 1.0
+    manager.relevance_ema.setdefault("mean", {})[key2] = 1.0
     # Only one free block: only one of the two pending requests can succeed.
     pool = _StubBlockPool(20, free_blocks=1)
     sched = _make_connector_scheduler(manager, pool)
@@ -347,7 +436,7 @@ def test_on_request_preempted_queues_for_retry_on_failure():
     manager = SemanticOffloadingManager(num_blocks=10)
     key = to_key(1)
     _insert_resident(manager, key, block_id=0)
-    manager.relevance_ema.setdefault("minmax", {})[key] = 1.0
+    manager.relevance_ema.setdefault("mean", {})[key] = 1.0
     sched = _make_connector_scheduler(manager, _StubBlockPool(20, free_blocks=0))
     _add_req_status(sched, "r1", keys=[key])
 
@@ -368,7 +457,7 @@ def test_on_request_preempted_never_reserves_synchronously():
     manager = SemanticOffloadingManager(num_blocks=10)
     key = to_key(1)
     _insert_resident(manager, key, block_id=0)
-    manager.relevance_ema.setdefault("minmax", {})[key] = 1.0
+    manager.relevance_ema.setdefault("mean", {})[key] = 1.0
     sched = _make_connector_scheduler(manager, _StubBlockPool(20, free_blocks=5))
     _add_req_status(sched, "r1", keys=[key])
 
@@ -391,7 +480,7 @@ def test_on_request_preempted_is_noop_when_prefetch_disabled():
     manager = SemanticOffloadingManager(num_blocks=10)
     key = to_key(1)
     _insert_resident(manager, key, block_id=0)
-    manager.relevance_ema.setdefault("minmax", {})[key] = 1.0
+    manager.relevance_ema.setdefault("mean", {})[key] = 1.0
     sched = _make_connector_scheduler(manager, _StubBlockPool(20, free_blocks=5))
     _add_req_status(sched, "r1", keys=[key])
 
@@ -410,7 +499,7 @@ def test_queue_preempted_seeds_pending_from_scheduler_output():
     manager = SemanticOffloadingManager(num_blocks=10)
     key = to_key(1)
     _insert_resident(manager, key, block_id=0)
-    manager.relevance_ema.setdefault("minmax", {})[key] = 1.0
+    manager.relevance_ema.setdefault("mean", {})[key] = 1.0
     sched = _make_connector_scheduler(manager, _StubBlockPool(20, free_blocks=0))
     _add_req_status(sched, "r1", keys=[key])
 
@@ -428,7 +517,7 @@ def test_queue_preempted_is_noop_when_prefetch_disabled():
     manager = SemanticOffloadingManager(num_blocks=10)
     key = to_key(1)
     _insert_resident(manager, key, block_id=0)
-    manager.relevance_ema.setdefault("minmax", {})[key] = 1.0
+    manager.relevance_ema.setdefault("mean", {})[key] = 1.0
     sched = _make_connector_scheduler(manager, _StubBlockPool(20, free_blocks=5))
     _add_req_status(sched, "r1", keys=[key])
 
@@ -446,7 +535,7 @@ def test_retry_pending_prefetches_skips_requests_preempted_this_step():
     manager = SemanticOffloadingManager(num_blocks=10)
     key = to_key(1)
     _insert_resident(manager, key, block_id=0)
-    manager.relevance_ema.setdefault("minmax", {})[key] = 1.0
+    manager.relevance_ema.setdefault("mean", {})[key] = 1.0
     sched = _make_connector_scheduler(manager, _StubBlockPool(20, free_blocks=5))
     _add_req_status(sched, "r1", keys=[key])
     sched._preempted_pending = {"r1"}
@@ -470,7 +559,7 @@ def test_successful_reservation_records_allocated_block_ids():
     manager = SemanticOffloadingManager(num_blocks=10)
     key = to_key(1)
     _insert_resident(manager, key, block_id=0)
-    manager.relevance_ema.setdefault("minmax", {})[key] = 1.0
+    manager.relevance_ema.setdefault("mean", {})[key] = 1.0
     sched = _make_connector_scheduler(manager, _StubBlockPool(20, free_blocks=5))
     _add_req_status(sched, "r1", keys=[key])
 
@@ -491,7 +580,7 @@ def test_successful_reservation_dispatches_to_prefetch_channel_not_load_jobs():
     manager = SemanticOffloadingManager(num_blocks=10)
     key = to_key(1)
     _insert_resident(manager, key, block_id=0)
-    manager.relevance_ema.setdefault("minmax", {})[key] = 1.0
+    manager.relevance_ema.setdefault("mean", {})[key] = 1.0
     sched = _make_connector_scheduler(manager, _StubBlockPool(20, free_blocks=5))
     _add_req_status(sched, "r1", keys=[key])
 
@@ -534,9 +623,62 @@ def test_partial_splice_identity_matches_even_with_reordered_prefetch():
     # keys_to_load is positionally [k0, k1, k2] -> dst [100, 101, 102].
     # k0's real content lives in GPU block 50, k1's in 51, k2's in 52 --
     # NOT the positionally-parallel [52, 51, 50] a naive zip would produce.
-    src_ids, dst_ids = sched._pending_splice_jobs["r1"]
+    src_ids, dst_ids = sched._pending_splice_jobs[0]
     assert (src_ids, dst_ids) == ([50, 51, 52], [100, 101, 102])
     assert "r1" not in sched._current_batch_load_jobs  # full cover, no remainder
+
+
+def test_partial_splice_uses_real_request_group_progress_field():
+    manager = SemanticOffloadingManager(num_blocks=10)
+    key = to_key(0)
+    sched = _make_connector_scheduler(manager, _StubBlockPool(20, free_blocks=5))
+    _add_req_status(sched, "r1", keys=[key])
+    sched._prefetched["r1"] = _PrefetchState(job_id=1, keys=[key], gpu_block_ids=[7])
+
+    assert sched._try_splice_prefetch(
+        SimpleNamespace(request_id="r1"), _make_pending_blocks(1), 1
+    )
+
+    state = sched._req_status["r1"].group_states[0]
+    assert state.next_stored_chunk_idx == 1
+    assert "next_stored_block_idx" not in state.__dict__
+
+
+def test_prefetch_blocks_remain_reserved_until_all_workers_ack_splice():
+    from unittest.mock import patch
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        OffloadingConnectorScheduler,
+    )
+
+    manager = SemanticOffloadingManager(num_blocks=10)
+    key = to_key(0)
+    pool = _StubBlockPool(20, free_blocks=4)
+    sched = _make_connector_scheduler(manager, pool)
+    sched.config.num_workers = 2
+    _add_req_status(sched, "r1", keys=[key])
+    sched._prefetched["r1"] = _PrefetchState(job_id=1, keys=[key], gpu_block_ids=[7])
+    sched._prefetch_reserved_blocks = 1
+
+    assert sched._try_splice_prefetch(
+        SimpleNamespace(request_id="r1"), _make_pending_blocks(1), 1
+    )
+    assert pool.get_num_free_blocks() == 4
+    assert sched._prefetch_reserved_blocks == 1
+    assert 0 in sched._pending_splice_releases
+
+    output = SimpleNamespace(
+        kv_connector_worker_meta=SemanticWorkerMetadata(completed_splices={0: 1})
+    )
+    with patch.object(OffloadingConnectorScheduler, "update_connector_output"):
+        sched.update_connector_output(output)
+        assert pool.get_num_free_blocks() == 4
+        assert sched._prefetch_reserved_blocks == 1
+        sched.update_connector_output(output)
+
+    assert pool.get_num_free_blocks() == 5
+    assert sched._prefetch_reserved_blocks == 0
+    assert sched._pending_splice_releases == {}
 
 
 def test_partial_splice_splits_into_splice_and_remainder_disjointly():
@@ -559,7 +701,7 @@ def test_partial_splice_splits_into_splice_and_remainder_disjointly():
         sched._try_splice_prefetch(SimpleNamespace(request_id="r1"), blocks, 3) is True
     )
 
-    src_ids, dst_ids = sched._pending_splice_jobs["r1"]
+    src_ids, dst_ids = sched._pending_splice_jobs[0]
     assert (src_ids, dst_ids) == ([77], [101])  # k1 spliced into its own dst
 
     assert len(sched._current_batch_load_jobs) == 1
@@ -613,7 +755,7 @@ def test_partial_splice_full_coverage_no_remainder_job_created():
         sched._try_splice_prefetch(SimpleNamespace(request_id="r1"), blocks, 2) is True
     )
 
-    assert "r1" in sched._pending_splice_jobs
+    assert 0 in sched._pending_splice_jobs
     assert not sched._current_batch_load_jobs
     assert not sched._req_status["r1"].transfer_jobs
 
@@ -711,8 +853,8 @@ def test_two_concurrent_partial_splices_dont_interfere():
         is True
     )
 
-    assert sched._pending_splice_jobs["req1"] == ([77], [101])
-    assert sched._pending_splice_jobs["req2"] == ([88], [200])
+    assert sched._pending_splice_jobs[0] == ([77], [101])
+    assert sched._pending_splice_jobs[1] == ([88], [200])
 
     assert len(sched._current_batch_load_jobs) == 2
     jobs_by_req = {job.req_id: job for job in sched._current_batch_load_jobs.values()}

@@ -29,14 +29,14 @@ from collections.abc import Callable
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
-
-from semantic_offload._debug import debug_print
 from vllm.config import VllmConfig
 from vllm.utils.torch_utils import _resolve_layer_name
 
+from semantic_offload._debug import debug_print
+
 
 class _BatchLayout:
-    __slots__ = ("req_ids", "boundaries", "num_tokens")
+    __slots__ = ("boundaries", "num_tokens", "req_ids")
 
     def __init__(self, req_ids: list[str], boundaries: list[tuple[int, int]]):
         self.req_ids = req_ids
@@ -44,7 +44,10 @@ class _BatchLayout:
         self.num_tokens = boundaries[-1][1] if boundaries else 0
 
 
-def _patch_prepare_inputs(state: dict) -> None:
+_prepare_inputs_state: dict = {"layout": None}
+
+
+def _patch_prepare_inputs() -> None:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
     if getattr(GPUModelRunner, "_semantic_prepare_inputs_patched", False):
@@ -60,7 +63,9 @@ def _patch_prepare_inputs(state: dict) -> None:
         for count in token_counts:
             boundaries.append((start, start + count))
             start += count
-        state["layout"] = _BatchLayout(req_ids=req_ids, boundaries=boundaries)
+        _prepare_inputs_state["layout"] = _BatchLayout(
+            req_ids=req_ids, boundaries=boundaries
+        )
         return result
 
     GPUModelRunner.prepare_inputs = wrapper
@@ -112,14 +117,18 @@ def install(
         "defaulting to the legacy runner needs a different patch point, see "
         "semantic-eviction-issues-log.md entry #6"
     )
-    state: dict = {"layout": None, "step_index": 0}
-    _patch_prepare_inputs(state)
+    if capture_stride < 1:
+        raise ValueError("capture_stride must be >= 1")
+    if num_queries_per_kv < 1:
+        raise ValueError("num_queries_per_kv must be >= 1")
+    state: dict = {"step_index": 0}
+    _patch_prepare_inputs()
 
     class ProbeMode(TorchDispatchMode):
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
             kwargs = kwargs or {}
             if "unified_attention_with_output" in str(func):
-                layout: _BatchLayout | None = state["layout"]
+                layout: _BatchLayout | None = _prepare_inputs_state["layout"]
                 query = args[0] if len(args) > 0 else kwargs.get("query")
                 layer_name_arg = args[4] if len(args) > 4 else kwargs.get("layer_name")
                 resolved_name = (
@@ -174,6 +183,10 @@ def install(
                         # GQA group (entry #9) -> [num_kv_heads, head_dim].
                         last_q = query[torch.tensor(last_indices, device=query.device)]
                         n_reqs, num_query_heads, head_dim = last_q.shape
+                        if num_query_heads % num_queries_per_kv:
+                            raise ValueError(
+                                "query heads must be divisible by num_queries_per_kv"
+                            )
                         num_kv_heads = num_query_heads // num_queries_per_kv
                         grouped = last_q.view(
                             n_reqs, num_kv_heads, num_queries_per_kv, head_dim

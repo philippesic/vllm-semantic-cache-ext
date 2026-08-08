@@ -297,6 +297,7 @@ _STORE_KEY = "vllm:kv_offload_store_bytes_total"
 
 NEEDLE_HIT = "hit"
 NEEDLE_MISS = "miss"
+NEEDLE_PARTIAL = "partial"
 NEEDLE_NOT_PRESSURED = "not_pressured"
 
 
@@ -318,11 +319,12 @@ def classify_needle_outcome(recall_load_bytes: float, recall_store_bytes: float)
     reconstruct the needle's blocks, read off two monotonic Prometheus
     counters isolated to the recall alone:
 
-      * ``load_bytes > 0``  -> the needle's blocks were served straight from
-        the CPU tier: the policy *preserved* them under pressure  -> HIT.
-      * ``load_bytes == 0`` and ``store_bytes > 0`` -> the blocks were absent
-        from both GPU and CPU tiers, so the recall had to recompute and
-        re-store them: the policy *evicted* them  -> MISS.
+      * ``load_bytes > 0`` and ``store_bytes == 0`` -> all observed recall
+        traffic was served straight from the CPU tier -> HIT.
+      * ``load_bytes > 0`` and ``store_bytes > 0`` -> some blocks loaded and
+        some recomputed/re-stored -> PARTIAL.
+      * ``load_bytes == 0`` and ``store_bytes > 0`` -> the needle's blocks
+        were absent from both tiers -> MISS.
       * ``load_bytes == 0`` and ``store_bytes == 0`` -> the blocks were still
         resident in the GPU prefix cache, so the CPU tier was never
         consulted at all: the run is *not under capacity pressure*, the
@@ -340,8 +342,11 @@ def classify_needle_outcome(recall_load_bytes: float, recall_store_bytes: float)
             recall request only.
 
     Returns:
-        One of ``NEEDLE_HIT``, ``NEEDLE_MISS``, ``NEEDLE_NOT_PRESSURED``.
+        One of ``NEEDLE_HIT``, ``NEEDLE_MISS``, ``NEEDLE_PARTIAL``, or
+        ``NEEDLE_NOT_PRESSURED``.
     """
+    if recall_load_bytes > 0 and recall_store_bytes > 0:
+        return NEEDLE_PARTIAL
     if recall_load_bytes > 0:
         return NEEDLE_HIT
     if recall_store_bytes > 0:

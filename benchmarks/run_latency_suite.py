@@ -43,7 +43,7 @@ from harness import metrics as metrics_mod
 from harness import needle_workload
 from harness import policies as policies_mod
 from harness import workloads as workloads_mod
-from harness.server import launch_server
+from harness.server import launch_server, resolve_vllm_cli
 
 RESULT_FIELDS = [
     "policy",
@@ -51,6 +51,7 @@ RESULT_FIELDS = [
     "workload",
     "sub_workload",
     "request_rate",
+    "parent_request_rate",
     "reference_count",
     "num_prompts",
     "duration_s",
@@ -64,8 +65,8 @@ RESULT_FIELDS = [
     "needle_hit_rate",
     # needle-v2's preservation signal (see needle_workload.classify_needle_
     # outcome): the recall's isolated CPU-tier interaction, not a string
-    # match. `needle_outcome` in {hit, miss, not_pressured}; the two byte
-    # columns are the recall-only counter deltas it was derived from.
+    # match. `needle_outcome` in {hit, partial, miss, not_pressured}; the two
+    # byte columns are the recall-only counter deltas it was derived from.
     "needle_outcome",
     "recall_load_bytes",
     "recall_store_bytes",
@@ -217,7 +218,7 @@ def run_vllm_bench_serve(
         workload, num_prompts=num_prompts, request_rate=request_rate, scale=scale
     )
     cmd = [
-        "vllm",
+        resolve_vllm_cli(),
         "bench",
         "serve",
         "--base-url",
@@ -360,6 +361,7 @@ def run_mixed_case(
                 "workload": "mixed",
                 "sub_workload": sub_workload,
                 "request_rate": sub_rate,
+                "parent_request_rate": rate,
                 "num_prompts": sub_num_prompts,
             }
         )
@@ -378,6 +380,7 @@ def run_mixed_case(
                 "seed": seed,
                 "workload": "mixed",
                 "sub_workload": "needle",
+                "parent_request_rate": rate,
                 "reference_count": ref_count,
             }
             before = _snap()
@@ -399,7 +402,7 @@ def run_mixed_case(
                     reference_count=ref_count,
                     num_distractors=max(1, 10 - ref_count),
                     model=model,
-                    seed=1_000_000 + i,
+                    seed=(seed or 0) * 10_000_000 + 1_000_000 + i,
                     snapshot_metrics=_snap if metrics_url else None,
                 )
                 row["needle_outcome"] = result["needle_outcome"]
@@ -607,6 +610,19 @@ def main():
             # docstring for why.
             needle_case_seed_base = args.seed if args.seed is not None else 0
 
+            def _needle_content_seed(
+                reference_count: int, case_seed: int = needle_case_seed_base
+            ) -> int:
+                # The DGX audit runs each reference-count arm against a fresh
+                # server and opts into identical content across arms. General
+                # multi-arm invocations retain disjoint content to avoid
+                # cross-case prefix reuse on their shared server.
+                if os.environ.get("NEEDLE_SHARED_CONTENT") == "1":
+                    return needle_workload.needle_case_content_seed(case_seed, 0)
+                return needle_workload.needle_case_content_seed(
+                    case_seed, reference_count
+                )
+
             try:
                 for workload in workloads:
                     if workload == "needle":
@@ -618,9 +634,7 @@ def main():
                                     reference_count=ref_count,
                                     num_distractors=needle_num_distractors,
                                     model=args.model,
-                                    seed=needle_workload.needle_case_content_seed(
-                                        needle_case_seed_base, ref_count
-                                    ),
+                                    seed=_needle_content_seed(ref_count),
                                 )
                                 after = metrics_mod.snapshot(handle.metrics_url())
                                 delta = metrics_mod.diff(before, after)
@@ -672,8 +686,8 @@ def main():
                         # (--num-gpu-blocks-override) and a small
                         # --cpu-bytes-to-use, else every cell reads
                         # not_pressured (the built-in validity check).
-                        def _snap():
-                            return metrics_mod.snapshot(handle.metrics_url())
+                        def _snap(server_handle=handle):
+                            return metrics_mod.snapshot(server_handle.metrics_url())
 
                         for ref_count in ref_counts:
                             try:
@@ -683,9 +697,7 @@ def main():
                                     reference_count=ref_count,
                                     num_distractors=needle_num_distractors,
                                     model=args.model,
-                                    seed=needle_workload.needle_case_content_seed(
-                                        needle_case_seed_base, ref_count
-                                    ),
+                                    seed=_needle_content_seed(ref_count),
                                     snapshot_metrics=_snap,
                                     settle_s=args.needle_settle_s,
                                     max_settle_polls=args.needle_max_settle_polls,

@@ -12,7 +12,8 @@ layout and known values, so it runs on CPU and needs no GPU.
 from types import SimpleNamespace
 
 import torch
-from semantic_offload.worker import SemanticOffloadingWorker
+
+from semantic_offload.worker import SemanticOffloadingWorker, select_probe_layer
 
 
 def _make_layer(num_blocks, num_kv_heads, block_size, head_size, seed):
@@ -46,7 +47,16 @@ def _make_worker(layers: dict, block_size: int) -> SemanticOffloadingWorker:
     # is still out of scope here.
     worker._probe_layer_name = next(iter(layers), None)
     worker._pending_job_keys = {}
+    worker._pending_job_blocks = {}
     worker.durable_summaries = {}
+    worker._max_durable_summaries = 100
+    worker._stack_cache_dirty = True
+    worker._stack_cache_keys = []
+    worker._stack_cache = {}
+    worker._stack_cache_index = {}
+    worker._stack_pending_insert = set()
+    worker._stack_pending_remove = set()
+    worker._pending_scores = {}
     return worker
 
 
@@ -132,3 +142,40 @@ def test_only_the_probe_layer_gets_summaries_built():
     assert worker.summaries["layer1"] != {}
     assert worker.summaries["layer0"] == {}
     assert worker.summaries["layer2"] == {}
+
+
+def test_probe_layer_uses_natural_model_order():
+    layers = ["model.layers.10.attn", "model.layers.2.attn", "model.layers.1.attn"]
+
+    assert select_probe_layer(layers, "first") == "model.layers.1.attn"
+    assert select_probe_layer(layers, "middle") == "model.layers.2.attn"
+    assert select_probe_layer(layers, "last") == "model.layers.10.attn"
+    assert select_probe_layer(layers, 1) == "model.layers.2.attn"
+
+
+def test_explicit_job_layout_combines_blocks_without_identity_blur():
+    layer = _make_layer(4, 1, 2, 4, seed=5)
+    worker = _make_worker({"layer0": layer}, block_size=2)
+    from vllm.v1.kv_offload.base import make_offload_key
+
+    key_a = make_offload_key(b"a", 0)
+    key_b = make_offload_key(b"b", 0)
+    worker.receive_job_blocks({7: [(key_a, [2, 3]), (key_b, [0, 1])]})
+
+    worker._build_durable_summaries_for_job(7)
+
+    expected_a = layer.kv_cache[[2, 3], 0, :, :4].reshape(-1, 4).mean(dim=0)
+    expected_b = layer.kv_cache[[0, 1], 0, :, :4].reshape(-1, 4).mean(dim=0)
+    assert torch.allclose(worker.durable_summaries[key_a][0].mean, expected_a)
+    assert torch.allclose(worker.durable_summaries[key_b][0].mean, expected_b)
+
+
+def test_ambiguous_legacy_job_layout_is_skipped():
+    layer = _make_layer(3, 1, 2, 4, seed=6)
+    worker = _make_worker({"layer0": layer}, block_size=2)
+    from vllm.v1.kv_offload.base import make_offload_key
+
+    worker.receive_job_keys({8: [make_offload_key(b"a", 0), make_offload_key(b"b", 0)]})
+    worker._build_summaries_for_blocks(8, [0])
+
+    assert worker.durable_summaries == {}

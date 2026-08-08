@@ -16,7 +16,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
+
 from harness import adaptive_splice_probe, metrics, needle_workload, policies, workloads
+from harness import server as server_mod
 
 
 def test_kv_transfer_config_lru_uses_stock_offloading_connector():
@@ -24,6 +26,12 @@ def test_kv_transfer_config_lru_uses_stock_offloading_connector():
     assert config["kv_connector"] == "OffloadingConnector"
     assert "kv_connector_module_path" not in config
     assert config["kv_connector_extra_config"]["eviction_policy"] == "lru"
+
+
+def test_vllm_cli_honors_selected_environment(monkeypatch):
+    monkeypatch.setenv("VLLM_CLI", "/opt/vllm-env/bin/vllm")
+
+    assert server_mod.resolve_vllm_cli() == "/opt/vllm-env/bin/vllm"
 
 
 def test_kv_transfer_config_arc_selects_arc_eviction_policy():
@@ -237,13 +245,11 @@ def test_classify_needle_outcome_not_pressured_when_neither_counter_moved():
     )
 
 
-def test_classify_needle_outcome_prefers_hit_even_if_store_also_moved():
-    """A HIT can coincide with a small store (e.g. the recall's own trailing
-    question blocks): a positive load is decisive -- the needle's blocks did
-    come from the CPU tier."""
+def test_classify_needle_outcome_marks_mixed_load_and_store_partial():
+    """Mixed load/store traffic is not evidence of full preservation."""
     assert (
         needle_workload.classify_needle_outcome(917504.0, 458752.0)
-        == needle_workload.NEEDLE_HIT
+        == needle_workload.NEEDLE_PARTIAL
     )
 
 
@@ -1243,8 +1249,10 @@ def test_watch_for_splice_matches_partial_splice_with_spliced_ge_1(tmp_path):
     _write_lines(
         log_path,
         [
-            "PREFETCH_EFFECT_DEBUG cmpl-other-req-0-abc: PARTIAL SPLICE spliced=2 reloaded=1 covered=0.67",
-            "PREFETCH_EFFECT_DEBUG cmpl-TAG123-0-xyz: PARTIAL SPLICE spliced=1 reloaded=3 covered=0.25",
+            "PREFETCH_EFFECT_DEBUG cmpl-other-req-0-abc: PARTIAL SPLICE "
+            "spliced=2 reloaded=1 covered=0.67",
+            "PREFETCH_EFFECT_DEBUG cmpl-TAG123-0-xyz: PARTIAL SPLICE "
+            "spliced=1 reloaded=3 covered=0.25",
         ],
     )
     thread.join(timeout=5.0)
@@ -1260,7 +1268,8 @@ def test_watch_for_splice_ignores_zero_spliced_key_mismatch_lines(tmp_path):
     _write_lines(
         log_path,
         [
-            "PREFETCH_EFFECT_DEBUG cmpl-TAG123-0-xyz: KEY MISMATCH spliced=0 keys_to_load=5 prefetch.keys=5",
+            "PREFETCH_EFFECT_DEBUG cmpl-TAG123-0-xyz: KEY MISMATCH "
+            "spliced=0 keys_to_load=5 prefetch.keys=5",
         ],
     )
     result = adaptive_splice_probe.watch_for_splice(
@@ -1289,7 +1298,8 @@ def test_watch_for_splice_times_out_when_tag_never_appears(tmp_path):
     _write_lines(
         log_path,
         [
-            "PREFETCH_EFFECT_DEBUG cmpl-someone-else-0-xyz: PARTIAL SPLICE spliced=1 reloaded=0 covered=1.00"
+            "PREFETCH_EFFECT_DEBUG cmpl-someone-else-0-xyz: PARTIAL SPLICE "
+            "spliced=1 reloaded=0 covered=1.00"
         ],
     )
     result = adaptive_splice_probe.watch_for_splice(
@@ -1305,7 +1315,8 @@ def test_watch_for_splice_only_sees_lines_written_after_it_starts(tmp_path):
     substring by coincidence."""
     log_path = tmp_path / "server.log"
     log_path.write_text(
-        "PREFETCH_EFFECT_DEBUG cmpl-TAG123-0-old: PARTIAL SPLICE spliced=1 reloaded=0 covered=1.00\n"
+        "PREFETCH_EFFECT_DEBUG cmpl-TAG123-0-old: PARTIAL SPLICE "
+        "spliced=1 reloaded=0 covered=1.00\n"
     )
     result = adaptive_splice_probe.watch_for_splice(
         str(log_path), "TAG123", timeout_s=0.5, poll_interval_s=0.05

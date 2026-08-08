@@ -7,12 +7,12 @@ Register via kv_connector_extra_config={"spec_name": "SemanticOffloadingSpec",
 """
 
 from typing_extensions import override
+from vllm.v1.kv_offload.base import CanonicalKVCaches, OffloadingManager
+from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
 from semantic_offload._vllm_compat import spec_blocks_per_chunk
 from semantic_offload.manager import SemanticOffloadingManager
 from semantic_offload.worker import SemanticOffloadingWorker
-from vllm.v1.kv_offload.base import CanonicalKVCaches, OffloadingManager
-from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
 
 class SemanticOffloadingSpec(CPUOffloadingSpec):
@@ -21,7 +21,7 @@ class SemanticOffloadingSpec(CPUOffloadingSpec):
         # Worker-side scoring only ever needs the one configured method
         # (SemanticPolicy only consults its own method's relevance EMA) --
         # same extra_config key get_manager() already reads below.
-        method = str(self.extra_config.get("method", "minmax"))
+        method = str(self.extra_config.get("method", "mean"))
         # Only every capture_stride-th eligible query-capture step actually
         # scores/updates relevance (default 1: unchanged, every step) -- a
         # TTFT-tax follow-up knob, see query_capture.py's
@@ -29,6 +29,8 @@ class SemanticOffloadingSpec(CPUOffloadingSpec):
         # optimization pass. Relies on the manager's EMA staleness-tolerance
         # to carry signal across skipped steps.
         capture_stride = int(self.extra_config.get("capture_stride", 1))
+        probe_layer = self.extra_config.get("probe_layer", "middle")
+        head_aggregation = str(self.extra_config.get("head_aggregation", "mean"))
         return SemanticOffloadingWorker(
             kv_caches=kv_caches,
             blocks_per_chunk=spec_blocks_per_chunk(self),
@@ -36,6 +38,8 @@ class SemanticOffloadingSpec(CPUOffloadingSpec):
             vllm_config=self.vllm_config,
             method=method,
             capture_stride=capture_stride,
+            probe_layer=probe_layer,
+            head_aggregation=head_aggregation,
         )
 
     @override
@@ -59,7 +63,7 @@ class SemanticOffloadingSpec(CPUOffloadingSpec):
             # separate, selectable configs -- previously hardcoded to
             # manager.py's _DEFAULT_METHOD with no way to pick another at
             # launch time (issues log entry #34).
-            method = str(self.extra_config.get("method", "minmax"))
+            method = str(self.extra_config.get("method", "mean"))
             self._manager = SemanticOffloadingManager(
                 num_blocks=self.num_blocks,
                 enable_events=self.kv_events_config.enable_kv_cache_events,

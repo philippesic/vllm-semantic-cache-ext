@@ -20,16 +20,16 @@ project memory for that run's result.
 """
 
 import torch
-from semantic_offload.index import BlockSummary, build_summary, score
-from semantic_offload.manager import SemanticOffloadingManager
-from semantic_offload.spec import SemanticOffloadingSpec
-
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
     build_offloading_config,
 )
 from vllm.v1.kv_offload.base import OffloadingSpec, ReqContext, make_offload_key
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+
+from semantic_offload.index import BlockSummary, build_summary, score
+from semantic_offload.manager import SemanticOffloadingManager
+from semantic_offload.spec import SemanticOffloadingSpec
 
 # ---------------------------------------------------------------------------
 # 1. Spec loads via the real factory dynamic-import path
@@ -229,7 +229,7 @@ def test_semantic_manager_method_is_selectable():
     mean_manager = SemanticOffloadingManager(num_blocks=4, method="mean")
     cuboid_manager = SemanticOffloadingManager(num_blocks=4, method="cuboid_mean")
 
-    assert default_manager._policy._method == "minmax"
+    assert default_manager._policy._method == "mean"
     assert mean_manager._policy._method == "mean"
     assert cuboid_manager._policy._method == "cuboid_mean"
 

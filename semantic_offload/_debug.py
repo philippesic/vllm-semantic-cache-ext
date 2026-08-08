@@ -54,7 +54,7 @@ def record_timing(bucket: str, dt: float) -> None:
         )
 
 
-# bucket -> [sum, count, max]
+# bucket -> [cumulative_sum, cumulative_count, window_sum, window_count, window_max]
 _count_state: dict[str, list] = {}
 
 
@@ -71,18 +71,21 @@ def record_count(bucket: str, value: int) -> None:
     flag rather than adding a third one)."""
     if not TIMING:
         return
-    slot = _count_state.setdefault(bucket, [0, 0, 0])
+    slot = _count_state.setdefault(bucket, [0, 0, 0, 0, 0])
     slot[0] += value
     slot[1] += 1
-    slot[2] = max(slot[2], value)
+    slot[2] += value
+    slot[3] += 1
+    slot[4] = max(slot[4], value)
     if slot[1] % _TIMING_EVERY == 0:
-        total, count, peak = slot[0], slot[1], slot[2]
+        total, count, window_total, window_count, peak = slot
         print(
             f"SEMANTIC_COUNT bucket={bucket} pid={os.getpid()} calls={count} "
-            f"mean={total / count:.2f} max={peak}",
+            f"cumulative_mean={total / count:.2f} "
+            f"window_mean={window_total / window_count:.2f} window_max={peak}",
             flush=True,
         )
-        slot[2] = 0
+        slot[2:] = [0, 0, 0]
 
 
 # bucket -> call_count. Only the count is kept; the allocator stats
@@ -126,6 +129,37 @@ def record_gpu_memory(bucket: str) -> None:
         f"reserved_mb={reserved / 1048576:.1f} "
         f"inactive_split_mb={inactive_split / 1048576:.1f} "
         f"num_alloc_retries={retries}",
+        flush=True,
+    )
+
+
+_process_state_calls: dict[str, int] = {}
+
+
+def record_process_state(bucket: str) -> None:
+    """Emit low-frequency CPU memory and GC state for growth diagnosis."""
+    if not TIMING:
+        return
+    count = _process_state_calls.get(bucket, 0) + 1
+    _process_state_calls[bucket] = count
+    if count % _TIMING_EVERY != 0:
+        return
+    import gc
+
+    rss_mb = -1.0
+    try:
+        with open("/proc/self/statm", encoding="utf-8") as statm:
+            resident_pages = int(statm.read().split()[1])
+        rss_mb = resident_pages * os.sysconf("SC_PAGE_SIZE") / 1048576
+    except (FileNotFoundError, IndexError, OSError, ValueError):
+        pass
+    generations = gc.get_stats()
+    collections = ",".join(str(item["collections"]) for item in generations)
+    collected = ",".join(str(item["collected"]) for item in generations)
+    print(
+        f"SEMANTIC_PROCESS bucket={bucket} pid={os.getpid()} calls={count} "
+        f"rss_mb={rss_mb:.1f} gc_count={','.join(map(str, gc.get_count()))} "
+        f"gc_collections={collections} gc_collected={collected}",
         flush=True,
     )
 

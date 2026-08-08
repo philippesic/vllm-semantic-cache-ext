@@ -7,9 +7,10 @@ these tests cover the blending arithmetic and the LRU-equivalence fallback
 in isolation.
 """
 
-from semantic_offload.policy import SemanticPolicy
-from vllm.v1.kv_offload.base import make_offload_key
+from vllm.v1.kv_offload.base import ReqContext, make_offload_key
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus
+
+from semantic_offload.policy import SemanticPolicy
 
 
 def to_key(n: int):
@@ -35,6 +36,24 @@ def test_no_relevance_scores_matches_pure_recency_order():
     evicted = policy.evict(2, protected=set())
 
     assert [k for k, _ in evicted] == keys[:2]  # oldest two, LRU order
+
+
+def test_default_method_matches_live_mean_default():
+    policy = SemanticPolicy(cache_capacity=1)
+
+    assert policy._method == "mean"
+
+
+def test_touch_materializes_generator_once_for_chain_and_session_state():
+    policy = SemanticPolicy(cache_capacity=10, chain_aware=True, session_aware=True)
+    first, second = to_key(100), to_key(101)
+    _insert(policy, first)
+    _insert(policy, second)
+
+    policy.touch((key for key in (first, second)), ReqContext(req_id="req"))
+
+    assert policy._chain_successor[first] == second
+    assert policy._last_touch_req_id == {first: "req", second: "req"}
 
 
 def test_high_relevance_block_survives_eviction_despite_being_oldest():
@@ -450,3 +469,63 @@ def test_unscored_block_falls_back_to_recency_alongside_scored_blocks():
 
     assert evicted is not None
     assert evicted[0][0] == oldest_unscored
+
+
+def test_eviction_forgets_all_metadata_for_removed_key():
+    from vllm.v1.kv_offload.base import ReqContext
+
+    relevance = {"mean": {}}
+    policy = SemanticPolicy(
+        cache_capacity=10,
+        relevance_ema=relevance,
+        method="mean",
+        chain_aware=True,
+        session_aware=True,
+    )
+    head, tail = to_key(80), to_key(81)
+    _insert(policy, head)
+    _insert(policy, tail)
+    policy.touch([head, tail], ReqContext(req_id="first"))
+    policy.touch([head, tail], ReqContext(req_id="second"))
+    relevance["mean"][tail] = -1.0
+
+    evicted = policy.evict(1, protected=set())
+
+    assert evicted is not None
+    removed = evicted[0][0]
+    assert removed not in relevance["mean"]
+    assert removed not in policy._chain_successor
+    assert removed not in policy._chain_predecessors
+    assert removed not in policy._last_touch_req_id
+    assert removed not in policy._session_proven
+
+
+def test_clear_forgets_semantic_and_session_state():
+    from vllm.v1.kv_offload.base import ReqContext
+
+    relevance = {"mean": {}}
+    policy = SemanticPolicy(
+        cache_capacity=10,
+        relevance_ema=relevance,
+        method="mean",
+        chain_aware=True,
+        session_aware=True,
+        grace_window_blocks=2,
+    )
+    keys = [to_key(90), to_key(91)]
+    for key in keys:
+        _insert(policy, key)
+        relevance["mean"][key] = 1.0
+    policy.touch(keys, ReqContext(req_id="one"))
+    policy.touch(keys, ReqContext(req_id="two"))
+
+    policy.clear()
+
+    assert policy._lru.blocks == {}
+    assert relevance["mean"] == {}
+    assert policy._grace_expiry == {}
+    assert policy._chain_successor == {}
+    assert policy._chain_predecessors == {}
+    assert policy._last_touch_req_id == {}
+    assert policy._session_proven == set()
+    assert policy._last_touch_seq == {}

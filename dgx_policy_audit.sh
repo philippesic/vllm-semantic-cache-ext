@@ -26,6 +26,7 @@ SEEDS=${SEEDS:-1,2,3}
 CPU_BYTES=${CPU_BYTES:-91750400}
 GPU_BLOCKS=${GPU_BLOCKS:-120}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-2048}
+SCALE=${SCALE:-0.04}
 SERVING_DURATION_S=${SERVING_DURATION_S:-180}
 ABLATION_PROMPTS=${ABLATION_PROMPTS:-24}
 CELL_TIMEOUT_S=${CELL_TIMEOUT_S:-7200}
@@ -65,6 +66,7 @@ export NEEDLE_SHARED_CONTENT=1
   echo "cpu_bytes=$CPU_BYTES"
   echo "gpu_blocks=$GPU_BLOCKS"
   echo "max_model_len=$MAX_MODEL_LEN"
+  echo "scale=$SCALE"
   echo "semantic_offload_timing=$SEMANTIC_OFFLOAD_TIMING"
   echo "semantic_offload_timing_every=$SEMANTIC_OFFLOAD_TIMING_EVERY"
   echo "needle_shared_content=$NEEDLE_SHARED_CONTENT"
@@ -85,6 +87,7 @@ COMMON_ARGS=(
   --cpu-bytes-to-use "$CPU_BYTES"
   --num-gpu-blocks-override "$GPU_BLOCKS"
   --max-model-len "$MAX_MODEL_LEN"
+  --scale "$SCALE"
   --cell-timeout-s "$CELL_TIMEOUT_S"
 )
 

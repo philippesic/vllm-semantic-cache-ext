@@ -174,3 +174,39 @@ remain in `.claude/docs/` and the dated audit documents.
 
 - Validation after implementation: 200 tests passed with 15 known warnings;
   focused Ruff and formatting checks passed.
+
+## 2026-08-09: Loop 4 — query-capture lifecycle ownership
+
+- Replaced the unowned process-lifetime query-capture installation with a
+  closeable `QueryCaptureHandle`. Only one semantic capture owner may exist in
+  a process; a second install fails before changing hooks or callbacks.
+- `SemanticOffloadingWorker.shutdown()` now closes capture before shutting down
+  the inherited CPU transfer handlers. Each owning runner execution creates a
+  fresh dispatch mode and context-local request layout; close waits for active
+  execution before restoring the exact prior `prepare_inputs` and
+  `execute_model` methods.
+- The prepare-inputs wrapper accepts layouts only from the exact runner that
+  claimed the installation. Layout survives earlier attention layers, is
+  consumed once at the configured probe layer, and is cleared on execution,
+  mode-entry, or callback failure. Same-thread close raises instead of
+  deadlocking, while cross-thread close waits for quiescence.
+- External monkey-patch replacement is never overwritten during close; the
+  conflict is surfaced, ownership is released, and a later installation can
+  safely compose with the replacement.
+- FULL CUDA graphs are rejected before patching because their mixed/prefill
+  replay cannot expose attention to Python dispatch. The current supported
+  topology is deliberately one runner per process; concurrent runners fail
+  fast instead of sharing callbacks or layout state.
+- Query-capture and scoring compatibility are preflighted before the inherited
+  CPU offload worker allocates tensors or transfer handlers. If final hook
+  installation loses a race after allocation, construction shuts those base
+  resources down before propagating the error.
+- Added CPU behavior tests for active-owner rejection, exact restoration,
+  sequential reinstall, exact-runner isolation, non-probe-layer preservation,
+  exception cleanup, external-patch conflict, cross-thread quiescence,
+  same-thread deadlock prevention, guarded worker shutdown, FULL-mode rejection,
+  callback isolation, and worker shutdown order.
+- Validation after implementation: 212 tests passed with 15 known warnings;
+  focused Ruff and formatting checks passed.
+- A same-process sequential-engine Linux GPU smoke remains required because
+  native Windows cannot run the vLLM integration.

@@ -7,7 +7,7 @@ name = "semantic-offload"
 version = "0.1.0"
 description = "Query-aware semantic eviction/prefetch policy for vLLM's KV-cache CPU offloading"
 requires-python = ">=3.10"
-dependencies = ["torch"]
+dependencies = ["torch", "typing-extensions"]
 
 [tool.setuptools.packages.find]
 include = ["semantic_offload*"]

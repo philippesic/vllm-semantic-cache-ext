@@ -69,6 +69,7 @@ from semantic_offload.index import (
     score_minmax_batch,
 )
 from semantic_offload.query_capture import install as install_query_capture
+from semantic_offload.query_capture import preflight_install as preflight_query_capture
 
 _SCORING_METHODS = ("minmax", "mean", "cuboid_mean")
 _HEAD_AGGREGATIONS = ("mean", "max")
@@ -169,22 +170,10 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         probe_layer: str | int = "middle",
         head_aggregation: str = "mean",
     ):
-        # CPUOffloadingWorker's own param is named block_size_factor or
-        # blocks_per_chunk depending on the installed vLLM's version
-        # (#48150 renamed it on some checkouts, not others still in use
-        # across this project's machines) -- call via whichever name the
-        # real base class actually declares. See _vllm_compat.py.
-        init_cpu_offloading_worker_base(
-            self,
-            kv_caches=kv_caches,
-            blocks_per_chunk=blocks_per_chunk,
-            num_cpu_blocks=num_cpu_blocks,
-        )
         if method not in _SCORING_METHODS:
             raise ValueError(
                 f"Unknown scoring method: {method!r}. Supported: {_SCORING_METHODS}"
             )
-        self._method = method
         if capture_stride < 1:
             raise ValueError("capture_stride must be >= 1")
         if head_aggregation not in _HEAD_AGGREGATIONS:
@@ -192,7 +181,6 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
                 f"Unknown head_aggregation: {head_aggregation!r}. "
                 f"Supported: {_HEAD_AGGREGATIONS}"
             )
-        self._head_aggregation = head_aggregation
         parallel_config = vllm_config.parallel_config
         get_total_num_kv_heads = getattr(
             vllm_config.model_config, "get_total_num_kv_heads", None
@@ -218,11 +206,39 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
             use_mla=bool(getattr(vllm_config.model_config, "use_mla", False)),
         )
         static_forward_context = vllm_config.compilation_config.static_forward_context
-        self._attention_layers = {
+        attention_layers = {
             layer_name: layer
             for layer_name, layer in static_forward_context.items()
             if hasattr(layer, "num_kv_heads") and hasattr(layer, "head_size")
         }
+        probe_layer_name = select_probe_layer(attention_layers, selection=probe_layer)
+        num_queries_per_kv = None
+        if probe_layer_name is not None:
+            probe_attention = attention_layers[probe_layer_name]
+            num_attn_heads = vllm_config.model_config.get_num_attention_heads(
+                parallel_config
+            )
+            if num_attn_heads % probe_attention.num_kv_heads:
+                raise ValueError(
+                    "attention heads must be divisible by KV heads for query capture"
+                )
+            num_queries_per_kv = num_attn_heads // probe_attention.num_kv_heads
+            preflight_query_capture(vllm_config)
+
+        # CPUOffloadingWorker's own param is named block_size_factor or
+        # blocks_per_chunk depending on the installed vLLM's version
+        # (#48150 renamed it on some checkouts, not others still in use
+        # across this project's machines) -- call via whichever name the
+        # real base class actually declares. See _vllm_compat.py.
+        init_cpu_offloading_worker_base(
+            self,
+            kv_caches=kv_caches,
+            blocks_per_chunk=blocks_per_chunk,
+            num_cpu_blocks=num_cpu_blocks,
+        )
+        self._method = method
+        self._head_aggregation = head_aggregation
+        self._attention_layers = attention_layers
         self._block_size = vllm_config.cache_config.block_size
         self._summary_stream = (
             torch.cuda.Stream() if torch.cuda.is_available() else None
@@ -241,9 +257,7 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         # Mid-model was used by the experiments that selected the current
         # scoring method. Keep the position configurable for controlled DGX
         # ablations and exact-name overrides.
-        self._probe_layer_name = select_probe_layer(
-            self._attention_layers, selection=probe_layer
-        )
+        self._probe_layer_name = probe_layer_name
         # One BlockSummary per KV head (not averaged across heads -- see
         # issues log entry #9; entry #7's pooled-average version is
         # superseded).
@@ -285,22 +299,25 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         self._splice_events: dict[int, torch.cuda.Event | None] = {}
         self._query_capture_mode = None
         if self._probe_layer_name is not None:
-            probe_layer = self._attention_layers[self._probe_layer_name]
-            num_attn_heads = vllm_config.model_config.get_num_attention_heads(
-                vllm_config.parallel_config
-            )
-            num_queries_per_kv = num_attn_heads // probe_layer.num_kv_heads
-            if num_attn_heads % probe_layer.num_kv_heads:
-                raise ValueError(
-                    "attention heads must be divisible by KV heads for query capture"
+            assert num_queries_per_kv is not None
+            try:
+                self._query_capture_mode = install_query_capture(
+                    vllm_config,
+                    self._probe_layer_name,
+                    self._on_queries_captured,
+                    num_queries_per_kv=num_queries_per_kv,
+                    capture_stride=capture_stride,
                 )
-            self._query_capture_mode = install_query_capture(
-                vllm_config,
-                self._probe_layer_name,
-                self._on_queries_captured,
-                num_queries_per_kv=num_queries_per_kv,
-                capture_stride=capture_stride,
-            )
+            except BaseException:
+                super().shutdown()
+                raise
+
+    def shutdown(self) -> None:
+        query_capture = self._query_capture_mode
+        if query_capture is not None:
+            query_capture.close()
+            self._query_capture_mode = None
+        super().shutdown()
 
     def receive_job_keys(self, store_job_keys: dict[int, list[OffloadKey]]) -> None:
         """Called by SemanticOffloadingConnector before this step's

@@ -25,12 +25,26 @@ for active work belong here.
 ### CP-002: Query-capture installation has process-global lifecycle state
 
 - **Priority:** P1 correctness/compatibility
-- **State:** needs design
+- **State:** fixed in local lifecycle tests; Linux GPU smoke pending
 - **Evidence:** `semantic_offload/query_capture.py` keeps module-global patch
-  state and has no unregister path. Sequential or concurrent engines can retain
-  stale callbacks or layout state.
-- **Next:** specify install/unregister ownership and test two engines plus
-  unregister/reinstall before changing the hook.
+  state. Previously it had no unregister path, so sequential engines retained
+  class patches, dispatch modes, callbacks, and request layout state.
+- **Change:** installation now returns one process-owned, closeable handle;
+  concurrent installs fail before mutation; worker shutdown closes the handle;
+  exact prior methods are restored; external patch conflicts fail closed; and
+  every execution gets a fresh dispatch mode and context-local request layout
+  owned by one exact runner. Layout is consumed once at the probe layer;
+  execution, mode-entry, and callback failures clear context. Close waits for
+  in-flight execution, rejects same-thread close instead of deadlocking, and
+  permits a clean sequential reinstall. The current supported topology is one
+  runner per process; concurrent runners fail fast. FULL CUDA graphs are
+  rejected because they replay attention without Python dispatch; eager,
+  PIECEWISE, FULL_DECODE_ONLY, and default FULL_AND_PIECEWISE remain supported.
+  Compatibility and ownership are preflighted before base offload resources
+  are allocated, with cleanup if final installation loses a race.
+- **Next:** on a Linux GPU host, construct/serve/shut down engine A and then
+  construct/serve engine B in the same process, proving only the current
+  engine's callback and scoring metadata appear.
 
 ### CP-003: Relevance updates transfer O(requests x candidates) metadata
 

@@ -257,3 +257,18 @@ remain in `.claude/docs/` and the dated audit documents.
   focused Ruff and formatting checks passed. Two adversarial review rounds found
   no production correctness blocker after malformed dual-format metadata and
   stale compact updates were made fail-closed.
+
+## 2026-08-09: Loop 6 — interruption cleanup design audit
+
+- Traced the grid-cell, vLLM-server, and mixed benchmark-client subprocess
+  lifecycles. They can occupy separate sessions, while the grid only tracks the
+  cell leader and uses `fuser` as a Linux-only detached-server fallback.
+- Built and tested a preliminary stored-PGID TERM/KILL/reap path, readiness
+  cleanup, and grid signal guard. The focused harness and full 224-test suite
+  passed, but two adversarial reviews found ownership blockers that tests could
+  not make safe: numeric PGID reuse, detached groups outside the cell session,
+  reentrant multi-slot signal cleanup, and uncancellable mixed-client threads.
+- Reverted the complete trial before commit. The durable CP-006 design now
+  requires a lifetime-authenticated supervisor spanning cells, servers, and
+  benchmark clients, with bounded controlled unwinding and synthetic
+  descendant tests. No partial signal/PGID patch remains in the worktree.

@@ -106,9 +106,23 @@ for active work belong here.
 ### CP-006: Interrupted grid runs can orphan server processes
 
 - **Priority:** P2 harness reliability
-- **State:** open
-- **Next:** add parent-interruption cleanup and prove it against synthetic child
-  processes before using it in GPU runs.
+- **State:** ownership design required; unsafe partial fix rejected
+- **Evidence:** the grid has no interruption guard; server launch can be
+  interrupted before its handle is registered; cells, servers, and mixed
+  benchmark clients use separate process groups; and failed cells rely on
+  Linux-only `fuser` to find an untracked server. A trial stored numeric PGIDs,
+  added TERM/KILL/reap, and registered signal cleanup, but adversarial review
+  rejected it: PGIDs can be reused after group death, blocking cleanup in a
+  signal handler is reentrant/unbounded across slots, detached server groups
+  remain invisible on macOS, and benchmark-client subprocesses remain owned by
+  waiting threads. The entire trial was reverted before commit.
+- **Next:** introduce one authenticated supervisor/ownership abstraction for
+  cell, server, and benchmark-client process trees; keep it alive until all
+  descendants are reaped; make mixed clients cancellable; preserve primary
+  exceptions on cleanup failure; and replace `fuser` with exact ownership.
+  Prove Ctrl-C/SIGTERM, readiness interruption, dead leader/live descendant,
+  forced kill, duplicate cleanup, and rapid-signal behavior with POSIX
+  synthetic processes before using it in GPU runs.
 
 ### CP-007: Full fail-closed audit has no preserved local result bundle
 

@@ -9,7 +9,7 @@ policy instance afterward. See .claude/docs/semantic-eviction-plan.md,
 Step 1.1.
 """
 
-from collections.abc import Collection
+from collections.abc import Collection, Mapping, Sequence
 
 from typing_extensions import override
 from vllm.v1.kv_offload.base import OffloadKey, PrepareStoreOutput, ReqContext
@@ -27,6 +27,48 @@ _DEFAULT_METHOD = "mean"
 # entry #10) -- the real bottleneck there was a timing/cold-start issue
 # (relevance signal arriving after the block was already evicted), not
 # insufficient semantic weighting, so raising the default wouldn't help.
+
+ComposedRelevanceUpdates = dict[str, dict[OffloadKey, tuple[float, float, float]]]
+
+
+def compose_relevance_updates(
+    scores: Mapping[str, Mapping[str, Sequence[tuple[OffloadKey, float]]]],
+) -> ComposedRelevanceUpdates:
+    """Compose request-ranked EMA observations into one affine update per key.
+
+    Each tuple is ``(decay, offset, unseen_value)``. Existing EMA state becomes
+    ``decay * previous + offset``; a key without state takes ``unseen_value``
+    to preserve the historical first-observation rule.
+    """
+    composed: ComposedRelevanceUpdates = {}
+    weights_by_length: dict[int, list[float]] = {}
+    for method, per_req in scores.items():
+        accumulators: dict[OffloadKey, list[float]] = {}
+        for ranked in per_req.values():
+            n = len(ranked)
+            weights = weights_by_length.get(n)
+            if weights is None:
+                denom = max(n - 1, 1)
+                weights = [
+                    _EMA_ALPHA * (1.0 - rank / denom) ** _EMA_RANK_POWER
+                    for rank in range(n)
+                ]
+                weights_by_length[n] = weights
+            for (key, new_score), weight in zip(ranked, weights):
+                keep = 1.0 - weight
+                previous = accumulators.get(key)
+                if previous is None:
+                    accumulators[key] = [keep, weight * new_score, new_score]
+                else:
+                    previous[0] *= keep
+                    previous[1] = keep * previous[1] + weight * new_score
+                    previous[2] = keep * previous[2] + weight * new_score
+        if accumulators:
+            composed[method] = {
+                key: (values[0], values[1], values[2])
+                for key, values in accumulators.items()
+            }
+    return composed
 
 
 class SemanticOffloadingManager(CPUOffloadingManager):
@@ -152,6 +194,21 @@ class SemanticOffloadingManager(CPUOffloadingManager):
                         if prev is None
                         else weight * new_score + (1 - weight) * prev
                     )
+
+    def apply_relevance_updates(
+        self, updates: Mapping[str, Mapping[OffloadKey, tuple[float, float, float]]]
+    ) -> None:
+        """Apply precomposed rank-weighted observations once per candidate."""
+        for method, method_updates in updates.items():
+            ema = self.relevance_ema.setdefault(method, {})
+            for key, (decay, offset, unseen_value) in method_updates.items():
+                policy = getattr(self, "_policy", None)
+                if policy is not None and policy.get(key) is None:
+                    continue
+                previous = ema.get(key)
+                ema[key] = (
+                    unseen_value if previous is None else decay * previous + offset
+                )
 
     def ranked_keys(self, method: str) -> list[tuple[OffloadKey, float]]:
         """Current EMA-ranked relevance for a scoring method, highest first.

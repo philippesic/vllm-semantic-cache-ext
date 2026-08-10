@@ -210,3 +210,50 @@ remain in `.claude/docs/` and the dated audit documents.
   focused Ruff and formatting checks passed.
 - A same-process sequential-engine Linux GPU smoke remains required because
   native Windows cannot run the vLLM integration.
+
+## 2026-08-09: Loop 5 — compact relevance-update metadata
+
+- Derived an affine composition for the existing rank-weighted EMA. For each
+  method/candidate, `(decay, offset, unseen_value)` reproduces the ordered
+  request updates while preserving the special rule that a candidate's first
+  observation initializes its EMA exactly, even when its rank weight is zero.
+- Added a TP=1 compact metadata path for multi-request steps. TP>1 retains raw
+  request/candidate scores until complete head reduction and deterministic
+  global ranking, then composes before scheduler application. Single-request
+  steps remain on the legacy path after measurement showed no compaction gain.
+- Added randomized seeded-state and production-path differential tests,
+  including missing candidates, zero-weight first observations, TP reduction,
+  incomplete contributor groups, compact versus raw transport, and connector
+  application. Values match the sequential oracle within `1e-14` and preserve
+  relevance ordering.
+- Added `benchmarks/relevance_update_metadata.py`, which starts both arms from
+  identical ranked scores and times the production multiprocess object envelope:
+  the actual response enum, `ModelRunnerOutput`, and KV metadata serialized as
+  a tensor-free highest-protocol pickle payload. Queue framing is excluded. It
+  also measures seeded scheduler folding and combined post-ranking CPU. Every
+  cell performs a full encode/decode round trip; timing uses thread CPU time
+  with GC disabled. Final command:
+
+  ```text
+  PYTHONPATH=/Users/pippo/github/vllm-semantic-cache \
+    .venv/bin/python benchmarks/relevance_update_metadata.py \
+    --warmups 2 --repetitions 20
+  ```
+
+  | Requests | Candidates | Raw envelope bytes | Compact envelope bytes | Byte reduction | Scheduler speedup | Pipeline speedup |
+  |---:|---:|---:|---:|---:|---:|---:|
+  | 16 | 512 | 139,522 | 28,968 | 4.82x | 32.33x | 1.61x |
+  | 16 | 2,048 | 563,576 | 111,925 | 5.04x | 32.16x | 1.52x |
+  | 56 | 512 | 466,087 | 29,648 | 15.72x | 109.75x | 1.82x |
+  | 56 | 2,048 | 1,873,476 | 112,605 | 16.64x | 113.45x | 1.66x |
+
+- Acceptance cells (`requests>=16`, `candidates>=512`) require at least 4x
+  envelope reduction, 4x seeded scheduler speedup, and no post-ranking pipeline
+  regression; all four passed. One-request rows are explicitly labeled
+  `legacy_fallback` and execute raw metadata in production. A Linux serving run
+  remains necessary to measure end-to-end queueing and worker/scheduler overlap,
+  especially for TP>1.
+- Validation after implementation: 221 tests passed with 15 known warnings;
+  focused Ruff and formatting checks passed. Two adversarial review rounds found
+  no production correctness blocker after malformed dual-format metadata and
+  stale compact updates were made fail-closed.

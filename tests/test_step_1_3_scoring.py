@@ -6,6 +6,8 @@ the real server instead; see .claude/docs/semantic-eviction-plan.md Step 1.3
 and the issues log for that investigation).
 """
 
+import random
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -20,7 +22,10 @@ from semantic_offload.connector import (
     SemanticWorkerMetadata,
 )
 from semantic_offload.index import BlockSummary, score
-from semantic_offload.manager import SemanticOffloadingManager
+from semantic_offload.manager import (
+    SemanticOffloadingManager,
+    compose_relevance_updates,
+)
 from semantic_offload.worker import SemanticOffloadingWorker, validate_parallel_scoring
 
 
@@ -575,6 +580,240 @@ def test_manager_update_relevance_ema():
     assert manager.ranked_keys("minmax") == []  # untouched method stays empty
 
 
+def test_composed_relevance_updates_match_sequential_oracle():
+    rng = random.Random(20260809)
+    keys = [to_key(i) for i in range(12)]
+    scores = {"mean": {}}
+    for request_index in range(9):
+        present = rng.sample(keys, rng.randint(1, len(keys)))
+        values = {key: rng.uniform(-3.0, 3.0) for key in present}
+        scores["mean"][f"req-{request_index}"] = sorted(
+            values.items(), key=lambda item: (-item[1], item[0])
+        )
+    initial = {"mean": {key: rng.uniform(-1.0, 1.0) for key in keys[:5]}}
+    sequential = SemanticOffloadingManager.__new__(SemanticOffloadingManager)
+    sequential.relevance_ema = deepcopy(initial)
+    compact = SemanticOffloadingManager.__new__(SemanticOffloadingManager)
+    compact.relevance_ema = deepcopy(initial)
+
+    sequential.update_relevance(scores)
+    compact.apply_relevance_updates(compose_relevance_updates(scores))
+
+    assert compact.relevance_ema.keys() == sequential.relevance_ema.keys()
+    assert compact.relevance_ema["mean"] == pytest.approx(
+        sequential.relevance_ema["mean"], rel=1e-14, abs=1e-14
+    )
+    assert [key for key, _ in compact.ranked_keys("mean")] == [
+        key for key, _ in sequential.ranked_keys("mean")
+    ]
+
+
+def test_composed_update_preserves_unseen_zero_weight_observation():
+    top, bottom = to_key(20), to_key(21)
+    scores = {"mean": {"req": [(top, 9.0), (bottom, -4.0)]}}
+    updates = compose_relevance_updates(scores)
+    manager = SemanticOffloadingManager.__new__(SemanticOffloadingManager)
+    manager.relevance_ema = {}
+
+    manager.apply_relevance_updates(updates)
+
+    assert manager.relevance_ema["mean"][top] == 9.0
+    assert manager.relevance_ema["mean"][bottom] == -4.0
+    assert updates["mean"][bottom][0:2] == (1.0, -0.0)
+
+
+def test_compose_after_tp_reduction_matches_raw_global_ranking():
+    key_a, key_b, key_c = to_key(30), to_key(31), to_key(32)
+    left = SemanticWorkerMetadata(
+        pending_scores={
+            "mean": {
+                "req-a": [(key_a, 4.0), (key_b, 2.0), (key_c, 0.0)],
+                "req-b": [(key_c, 8.0), (key_b, 3.0), (key_a, 1.0)],
+            }
+        },
+        score_head_counts={"mean": {"req-a": 1, "req-b": 1}},
+        score_worker_counts={"mean": {"req-a": 1, "req-b": 1}},
+        score_reduction="mean",
+        score_group_size=2,
+        score_contributors=1,
+    )
+    right = SemanticWorkerMetadata(
+        pending_scores={
+            "mean": {
+                "req-a": [(key_c, 6.0), (key_b, 4.0), (key_a, 2.0)],
+                "req-b": [(key_a, 7.0), (key_b, 5.0), (key_c, 1.0)],
+            }
+        },
+        score_head_counts={"mean": {"req-a": 1, "req-b": 1}},
+        score_worker_counts={"mean": {"req-a": 1, "req-b": 1}},
+        score_reduction="mean",
+        score_group_size=2,
+        score_contributors=1,
+    )
+    raw = left.aggregate(right).complete_scores()
+    sequential = SemanticOffloadingManager.__new__(SemanticOffloadingManager)
+    sequential.relevance_ema = {"mean": {key_a: 0.25}}
+    compact = SemanticOffloadingManager.__new__(SemanticOffloadingManager)
+    compact.relevance_ema = deepcopy(sequential.relevance_ema)
+
+    sequential.update_relevance(raw)
+    compact.apply_relevance_updates(compose_relevance_updates(raw))
+
+    assert compact.relevance_ema["mean"] == pytest.approx(
+        sequential.relevance_ema["mean"], rel=1e-14, abs=1e-14
+    )
+
+
+def test_single_worker_metadata_transports_only_composed_updates(monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+        OffloadingConnector,
+    )
+
+    key_a, key_b = to_key(40), to_key(41)
+    scores = {
+        "mean": {
+            "req-a": [(key_a, 2.0), (key_b, 1.0)],
+            "req-b": [(key_b, 3.0), (key_a, -1.0)],
+        }
+    }
+    worker = SimpleNamespace(
+        pop_pending_score_metadata=lambda: (
+            scores,
+            {"mean": {"req-a": 2, "req-b": 2}},
+            "mean",
+        )
+    )
+    connector = SemanticOffloadingConnector.__new__(SemanticOffloadingConnector)
+    connector.connector_worker = SimpleNamespace(worker=worker)
+    connector._score_group_size = 1
+    monkeypatch.setattr(
+        OffloadingConnector, "build_connector_worker_meta", lambda self: None
+    )
+
+    metadata = connector.build_connector_worker_meta()
+
+    assert isinstance(metadata, SemanticWorkerMetadata)
+    assert metadata.pending_scores == {}
+    assert metadata.score_head_counts == {}
+    assert metadata.complete_relevance_updates() == compose_relevance_updates(scores)
+
+
+def test_single_request_metadata_keeps_legacy_path(monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+        OffloadingConnector,
+    )
+
+    key = to_key(43)
+    scores = {"mean": {"req": [(key, 2.0)]}}
+    worker = SimpleNamespace(
+        pop_pending_score_metadata=lambda: (scores, {"mean": {"req": 2}}, "mean")
+    )
+    connector = SemanticOffloadingConnector.__new__(SemanticOffloadingConnector)
+    connector.connector_worker = SimpleNamespace(worker=worker)
+    connector._score_group_size = 1
+    monkeypatch.setattr(
+        OffloadingConnector, "build_connector_worker_meta", lambda self: None
+    )
+
+    metadata = connector.build_connector_worker_meta()
+
+    assert isinstance(metadata, SemanticWorkerMetadata)
+    assert metadata.pending_scores == scores
+    assert metadata.relevance_updates == {}
+
+
+def test_multi_worker_metadata_keeps_raw_scores_until_complete(monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+        OffloadingConnector,
+    )
+
+    key = to_key(42)
+    scores = {"mean": {"req": [(key, 2.0)]}}
+    worker = SimpleNamespace(
+        pop_pending_score_metadata=lambda: (scores, {"mean": {"req": 2}}, "mean")
+    )
+    connector = SemanticOffloadingConnector.__new__(SemanticOffloadingConnector)
+    connector.connector_worker = SimpleNamespace(worker=worker)
+    connector._score_group_size = 2
+    monkeypatch.setattr(
+        OffloadingConnector, "build_connector_worker_meta", lambda self: None
+    )
+
+    metadata = connector.build_connector_worker_meta()
+
+    assert isinstance(metadata, SemanticWorkerMetadata)
+    assert metadata.pending_scores == scores
+    assert metadata.relevance_updates == {}
+    assert metadata.complete_scores() == {}
+
+
+def test_connector_applies_legacy_and_compact_metadata_equivalently(monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+        OffloadingConnector,
+    )
+
+    key_a, key_b = to_key(44), to_key(45)
+    one_request = {"mean": {"req-a": [(key_a, 2.0), (key_b, -1.0)]}}
+    two_requests = {
+        "mean": {
+            "req-a": [(key_a, 2.0), (key_b, -1.0)],
+            "req-b": [(key_b, 4.0), (key_a, 0.5)],
+        }
+    }
+    monkeypatch.setattr(
+        OffloadingConnector, "update_connector_output", lambda self, output: None
+    )
+
+    for scores, compact_metadata in (
+        (one_request, False),
+        (two_requests, True),
+    ):
+        expected = SemanticOffloadingManager.__new__(SemanticOffloadingManager)
+        expected.relevance_ema = {"mean": {key_a: 0.25}}
+        expected.update_relevance(scores)
+        actual = SemanticOffloadingManager.__new__(SemanticOffloadingManager)
+        actual.relevance_ema = {"mean": {key_a: 0.25}}
+        connector = SemanticOffloadingConnector.__new__(SemanticOffloadingConnector)
+        connector.connector_scheduler = SimpleNamespace(manager=actual)
+        if compact_metadata:
+            metadata = SemanticWorkerMetadata(
+                relevance_updates=compose_relevance_updates(scores),
+                score_group_size=1,
+                score_contributors=1,
+            )
+        else:
+            metadata = SemanticWorkerMetadata(
+                pending_scores=scores,
+                score_worker_counts={"mean": {"req-a": 1}},
+                score_group_size=1,
+                score_contributors=1,
+            )
+
+        connector.update_connector_output(
+            KVConnectorOutput(kv_connector_worker_meta=metadata)
+        )
+
+        assert actual.relevance_ema["mean"] == pytest.approx(
+            expected.relevance_ema["mean"], rel=1e-14, abs=1e-14
+        )
+
+
+def test_metadata_rejects_raw_and_compact_score_representations():
+    key = to_key(46)
+    scores = {"mean": {"req": [(key, 1.0)]}}
+    metadata = SemanticWorkerMetadata(
+        pending_scores=scores,
+        relevance_updates=compose_relevance_updates(scores),
+        score_group_size=1,
+        score_contributors=1,
+    )
+
+    with pytest.raises(ValueError, match="raw and compact"):
+        metadata.complete_scores()
+    with pytest.raises(ValueError, match="raw and compact"):
+        metadata.complete_relevance_updates()
+
+
 def test_update_relevance_rank_weighting_protects_top_ranked_key():
     """Regression for issues log entry #60: a needle key that one probe query
     ranked highest must survive several subsequent distractor queries that
@@ -667,5 +906,22 @@ def test_delayed_score_does_not_resurrect_evicted_key():
     assert output is not None and output.evicted_keys == [old_key]
 
     manager.update_relevance({"mean": {"delayed": [(old_key, 99.0)]}})
+
+    assert old_key not in manager.relevance_ema.get("mean", {})
+
+
+def test_compact_update_does_not_resurrect_evicted_key():
+    from vllm.v1.kv_offload.base import ReqContext
+
+    manager = SemanticOffloadingManager(num_blocks=1, method="mean")
+    old_key, new_key = to_key(72), to_key(73)
+    output = manager.prepare_store([old_key], ReqContext(req_id="old"))
+    assert output is not None
+    manager.complete_store([old_key], ReqContext(req_id="old"))
+    output = manager.prepare_store([new_key], ReqContext(req_id="new"))
+    assert output is not None and output.evicted_keys == [old_key]
+    updates = compose_relevance_updates({"mean": {"delayed": [(old_key, 99.0)]}})
+
+    manager.apply_relevance_updates(updates)
 
     assert old_key not in manager.relevance_ema.get("mean", {})

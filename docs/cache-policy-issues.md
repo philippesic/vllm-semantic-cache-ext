@@ -49,13 +49,31 @@ for active work belong here.
 ### CP-003: Relevance updates transfer O(requests x candidates) metadata
 
 - **Priority:** P1 performance
-- **State:** measured problem, optimization not designed
+- **State:** compact update implemented locally; live Linux profiling pending
 - **Evidence:** the worker materializes and sorts every request/candidate score,
   then the scheduler repeats nested rank/EMA loops. Prior live runs show
   `query_captured_total` cost growing substantially even with stable candidate
   pool, batch size, and CUDA allocator counters.
-- **Next:** create a numerically equivalent composed-update oracle, measure
-  serialized payload size and CPU time, then trial an O(candidates) update mode.
+- **Change:** per-request rank-weighted EMA observations are composed into one
+  `(decay, offset, unseen_value)` update per candidate. TP=1 sends this compact
+  form when a step has multiple requests; TP>1 keeps raw scores until complete
+  head reduction/global ranking, then composes before the scheduler fold. A
+  one-request step stays on the legacy path because compact metadata is larger
+  and slower there. Randomized seeded-state, first-observation, TP reduction,
+  completeness, and connector-path oracles match the sequential implementation
+  within `1e-14` and preserve ranking.
+- **Measurement:** the tracked CPU benchmark uses the actual multiprocess
+  response enum plus the response, `ModelRunnerOutput`, and KV-connector object
+  envelope. It measures the tensor-free highest-protocol pickle payload with
+  decode round trips, excluding constant queue framing. At
+  56 requests and 512--2048 candidates, the full envelope was 15.7--16.6x
+  smaller, the seeded scheduler fold was 109.7--113.4x faster, and the complete
+  post-ranking metadata pipeline was 1.66--1.82x faster. At 16 requests it was
+  4.8--5.0x smaller and 1.52--1.61x faster overall.
+- **Next:** profile `query_rank_metadata`, metadata transport, and
+  `update_relevance` on a Linux GPU serving run. TP>1 pre-aggregation transport
+  remains O(requests x candidates) until ranking moves behind a distributed
+  score reduction.
 
 ### CP-004: Raw score scale is not calibrated across queries
 

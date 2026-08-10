@@ -75,6 +75,10 @@ from semantic_offload._vllm_compat import (
     scheduler_being_loaded_set,
     set_next_stored_chunk_idx,
 )
+from semantic_offload.manager import (
+    ComposedRelevanceUpdates,
+    compose_relevance_updates,
+)
 from semantic_offload.store_layout import build_store_job_layout
 
 if TYPE_CHECKING:
@@ -85,6 +89,11 @@ if TYPE_CHECKING:
 RelevanceScores = dict[str, dict[str, list[tuple[OffloadKey, float]]]]
 ScoreHeadCounts = dict[str, dict[str, int]]
 ScoreWorkerCounts = dict[str, dict[str, int]]
+
+
+def _score_request_count(scores: RelevanceScores) -> int:
+    return sum(len(requests) for requests in scores.values())
+
 
 # Step 1.5 (semantic prefetch, see .claude/docs/semantic-eviction-plan.md and
 # issues log entries #23-#24). Bound on total GPU blocks any request's
@@ -151,6 +160,7 @@ class SemanticOffloadingConnectorMetadata(OffloadingConnectorMetadata):
 @dataclass
 class SemanticWorkerMetadata(OffloadingWorkerMetadata):
     pending_scores: RelevanceScores = field(default_factory=dict)
+    relevance_updates: ComposedRelevanceUpdates = field(default_factory=dict)
     score_head_counts: ScoreHeadCounts = field(default_factory=dict)
     score_worker_counts: ScoreWorkerCounts = field(default_factory=dict)
     score_reduction: str | None = None
@@ -159,8 +169,15 @@ class SemanticWorkerMetadata(OffloadingWorkerMetadata):
     # splice_id -> number of workers that have completed the GPU copy.
     completed_splices: dict[int, int] = field(default_factory=dict)
 
+    def _validate_score_representation(self) -> None:
+        if self.pending_scores and self.relevance_updates:
+            raise ValueError(
+                "Semantic worker metadata cannot contain raw and compact scores"
+            )
+
     def complete_scores(self) -> RelevanceScores:
         """Return only requests scored by the complete worker group."""
+        self._validate_score_representation()
         if (
             self.score_group_size is None
             or self.score_contributors != self.score_group_size
@@ -178,12 +195,25 @@ class SemanticWorkerMetadata(OffloadingWorkerMetadata):
                 complete[method] = complete_reqs
         return complete
 
+    def complete_relevance_updates(self) -> ComposedRelevanceUpdates:
+        """Return compact updates only from a complete single-worker group."""
+        self._validate_score_representation()
+        if (
+            self.score_group_size != 1
+            or self.score_contributors != self.score_group_size
+        ):
+            return {}
+        return self.relevance_updates
+
     def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetadata:
         assert isinstance(other, OffloadingWorkerMetadata)
         base = super().aggregate(other)
         merged_scores: RelevanceScores = {
             method: {req_id: list(ranked) for req_id, ranked in reqs.items()}
             for method, reqs in self.pending_scores.items()
+        }
+        merged_updates: ComposedRelevanceUpdates = {
+            method: dict(updates) for method, updates in self.relevance_updates.items()
         }
         merged_counts: ScoreHeadCounts = {
             method: dict(reqs) for method, reqs in self.score_head_counts.items()
@@ -192,6 +222,15 @@ class SemanticWorkerMetadata(OffloadingWorkerMetadata):
             method: dict(reqs) for method, reqs in self.score_worker_counts.items()
         }
         other_scores = getattr(other, "pending_scores", {})
+        other_updates = getattr(other, "relevance_updates", {})
+        if merged_updates and other_updates:
+            raise ValueError("Cannot aggregate multiple compact relevance updates")
+        if (merged_updates and other_scores) or (other_updates and merged_scores):
+            raise ValueError("Cannot aggregate compact and raw relevance metadata")
+        if other_updates:
+            merged_updates = {
+                method: dict(updates) for method, updates in other_updates.items()
+            }
         other_head_counts = getattr(other, "score_head_counts", {})
         other_worker_counts = getattr(other, "score_worker_counts", {})
         other_reduction = getattr(other, "score_reduction", None)
@@ -275,6 +314,7 @@ class SemanticWorkerMetadata(OffloadingWorkerMetadata):
             completed_jobs=base.completed_jobs,
             transfer_stats=base.transfer_stats,
             pending_scores=merged_scores,
+            relevance_updates=merged_updates,
             score_head_counts=merged_counts,
             score_worker_counts=merged_worker_counts,
             score_reduction=score_reduction,
@@ -1121,6 +1161,11 @@ class SemanticOffloadingConnector(OffloadingConnector):
             )
         else:
             raise TypeError("Semantic worker does not provide versioned score metadata")
+        relevance_updates: ComposedRelevanceUpdates = {}
+        if self._score_group_size == 1 and _score_request_count(scores) > 1:
+            relevance_updates = compose_relevance_updates(scores)
+            scores = {}
+            score_head_counts = {}
         score_worker_counts: ScoreWorkerCounts = {
             method: {req_id: 1 for req_id in reqs} for method, reqs in scores.items()
         }
@@ -1135,6 +1180,7 @@ class SemanticOffloadingConnector(OffloadingConnector):
             completed_jobs=base_meta.completed_jobs,
             transfer_stats=base_meta.transfer_stats,
             pending_scores=scores,
+            relevance_updates=relevance_updates,
             score_head_counts=score_head_counts,
             score_worker_counts=score_worker_counts,
             score_reduction=score_reduction,
@@ -1145,21 +1191,32 @@ class SemanticOffloadingConnector(OffloadingConnector):
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         meta = connector_output.kv_connector_worker_meta
-        scores = (
-            meta.complete_scores() if isinstance(meta, SemanticWorkerMetadata) else None
-        )
+        updates: ComposedRelevanceUpdates = {}
+        scores: RelevanceScores = {}
+        if isinstance(meta, SemanticWorkerMetadata):
+            updates = meta.complete_relevance_updates()
+            if not updates:
+                scores = meta.complete_scores()
+                if _score_request_count(scores) > 1:
+                    updates = compose_relevance_updates(scores)
+                    scores = {}
         super().update_connector_output(connector_output)
-        if scores and self.connector_scheduler is not None:
+        if (updates or scores) and self.connector_scheduler is not None:
             manager = self.connector_scheduler.manager
-            if hasattr(manager, "update_relevance"):
-                # Scheduler-side EMA fold, O(concurrent_reqs x pool_size) per
-                # step -- timed here rather than in manager.py to stay out of
-                # the parallel EMA-pollution edit (issues log open item #1).
+            if updates and hasattr(manager, "apply_relevance_updates"):
+                # Scheduler-side fold is O(pool_size); TP=1 also transports
+                # this compact form directly, while TP>1 composes only after
+                # its required cross-head score reduction and global ranking.
+                _t_ur = time.perf_counter() if _TIMING else 0.0
+                manager.apply_relevance_updates(updates)
+            elif scores and hasattr(manager, "update_relevance"):
                 _t_ur = time.perf_counter() if _TIMING else 0.0
                 manager.update_relevance(scores)
-                if _TIMING:
-                    record_count(
-                        "scheduler_relevance_entries",
-                        sum(len(values) for values in manager.relevance_ema.values()),
-                    )
-                    record_timing("update_relevance", time.perf_counter() - _t_ur)
+            else:
+                return
+            if _TIMING:
+                record_count(
+                    "scheduler_relevance_entries",
+                    sum(len(values) for values in manager.relevance_ema.values()),
+                )
+                record_timing("update_relevance", time.perf_counter() - _t_ur)

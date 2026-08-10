@@ -15,15 +15,14 @@ from typing_extensions import override
 from vllm.v1.kv_offload.base import OffloadKey, PrepareStoreOutput, ReqContext
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
-from semantic_offload.policy import SemanticPolicy
+from semantic_offload.policy import DEFAULT_POLICY_ALPHA, SemanticPolicy
 
 _EMA_ALPHA = 0.3  # ceiling weight on the newest observation; see update_relevance
-_EMA_RANK_POWER = 1.0  # unturned, like _DEFAULT_ALPHA below
+_EMA_RANK_POWER = 1.0  # unturned, like DEFAULT_POLICY_ALPHA
 # Mean is the strongest current live eviction result (5/6 needle-v2 cells,
 # versus 2/6 for minmax) and the strongest offline adversarial signal. Keep
 # every method selectable so the DGX audit can continue testing this default.
 _DEFAULT_METHOD = "mean"
-_DEFAULT_ALPHA = 0.5  # unturned; plan's Step 1.4 explicitly warns against 1.0.
 # A diagnostic run at alpha=0.95 gave an identical outcome to 0.5 (issues log
 # entry #10) -- the real bottleneck there was a timing/cold-start issue
 # (relevance signal arriving after the block was already evicted), not
@@ -43,6 +42,7 @@ class SemanticOffloadingManager(CPUOffloadingManager):
         session_aware: bool = False,
         session_bonus_half_life: int = 0,
         method: str = _DEFAULT_METHOD,
+        alpha: float = DEFAULT_POLICY_ALPHA,
     ) -> None:
         super().__init__(
             num_blocks=num_blocks,
@@ -65,7 +65,7 @@ class SemanticOffloadingManager(CPUOffloadingManager):
             cache_capacity=num_blocks,
             relevance_ema=self.relevance_ema,
             method=method,
-            alpha=_DEFAULT_ALPHA,
+            alpha=alpha,
             grace_window_blocks=grace_window_blocks,
             mode=eviction_mode,
             chain_aware=chain_aware,

@@ -10,13 +10,13 @@ reading a composed instance's own attribute from our own code, not a vLLM
 source edit, same class of technique as reading `layer.kv_cache` directly in
 Step 1.2) rather than calling `LRUCachePolicy.evict()` as a "peek", which
 would mutate its state as a side effect and corrupt the comparison. This is a
-first, minimal slice of the plan's Step 1.4 -- not its full design (no
-per-method selection surfaced yet, alpha is a constructor arg not a runtime
-config knob). See .claude/docs/semantic-eviction-plan.md Step 1.4 and
+first, minimal slice of the plan's Step 1.4 -- not its full design. See
+.claude/docs/semantic-eviction-plan.md Step 1.4 and
 issues log entries #10 and #11 (grace period -- temporary eviction immunity
 for freshly-inserted, as-yet-unscored blocks).
 """
 
+import math
 from collections.abc import Iterable
 from itertools import pairwise
 
@@ -35,6 +35,7 @@ from semantic_offload._debug import debug_print
 # seems to manifest at production scale/duration, which this counter is
 # meant to let a real B200 run actually observe).
 _SESSION_DEBUG_EVERY = 200
+DEFAULT_POLICY_ALPHA = 0.5
 
 
 class SemanticPolicy(CachePolicy):
@@ -51,7 +52,7 @@ class SemanticPolicy(CachePolicy):
         cache_capacity: int,
         relevance_ema: dict[str, dict[OffloadKey, float]] | None = None,
         method: str = "mean",
-        alpha: float = 0.5,
+        alpha: float = DEFAULT_POLICY_ALPHA,
         grace_window_blocks: int = 0,
         mode: str = "blend",
         chain_aware: bool = False,
@@ -63,6 +64,10 @@ class SemanticPolicy(CachePolicy):
         # -- updated in place by update_relevance() each step; we just read it.
         self._relevance_ema = relevance_ema if relevance_ema is not None else {}
         self._method = method
+        if not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
+            raise ValueError(f"alpha must be finite and in [0, 1], got {alpha!r}")
+        if mode == "unscored_last" and alpha != DEFAULT_POLICY_ALPHA:
+            raise ValueError("alpha is not used by unscored_last eviction mode")
         self._alpha = alpha
         # "blend" (default): score = alpha*relevance + (1-alpha)*recency, one
         # continuous ranking. "unscored_last" (issues log entry #11/#18): a

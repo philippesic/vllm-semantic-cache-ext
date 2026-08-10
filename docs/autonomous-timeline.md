@@ -128,3 +128,49 @@ remain in `.claude/docs/` and the dated audit documents.
   every natural arm kept all needle blocks in relevance-only top-8/top-16, but
   the fixed 0.5 relevance/recency blend kept none. This is tracked as CP-014;
   score normalization is not being used to disguise that downstream tradeoff.
+
+## 2026-08-09: Loop 3 — relevance/recency blend sweep
+
+- Built a held-out model-trace sweep for policy alpha. Each of four cases has a
+  two-block target fact, a separate two-block semantic decoy, filler, one target
+  update, one decoy update, six unrelated updates, and two held-out queries.
+- Replayed target and decoy recency independently across all nine
+  oldest/middle/newest combinations at capacities 8/16/24/32. Model inference
+  is shared across alpha arms, so every comparison has identical scores,
+  candidate coverage, held-out attention labels, and recency order.
+- The Windows-side simulator was checked locally against the real
+  `SemanticPolicy` on all 288 alpha/capacity/recency combinations with random
+  relevance plus the exact alpha-0.5 boundary tie. Every survivor set matched.
+- Alpha 0.6 was selected as the conservative experimental arm over 0.5:
+
+  | Capacity | Metric | alpha 0.5 | alpha 0.6 |
+  |---:|---|---:|---:|
+  | 8 | complete needle | 0.6667 | 0.8333 |
+  | 8 | balanced held-out attention | 0.2865 | 0.3715 |
+  | 8 | complete stale decoy | 0.4167 | 0.5833 |
+  | 16 | complete needle | 0.6667 | 0.9167 |
+  | 16 | balanced held-out attention | 0.2161 | 0.3568 |
+  | 16 | complete stale decoy | 0.6667 | 0.6667 |
+  | 24 | complete needle | 0.8611 | 1.0000 |
+  | 24 | balanced held-out attention | 0.3154 | 0.4682 |
+  | 24 | complete stale decoy | 0.6667 | 0.6667 |
+
+- There were no paired target, novel-topic, or balanced-attention regressions
+  at alpha 0.6. Higher values continued to improve this trace's attention
+  recall but increasingly retained stale semantic evidence, so they were not
+  promoted. This decoy was intentionally queried once and is a staleness
+  control, not a true false-positive label.
+- Exposed alpha through the existing `extra_config` path with finite `[0,1]`
+  validation. Alpha 0.6 is opt-in only; the behavioral default remains 0.5
+  until a Linux/DGX serving audit evaluates real preservation and
+  performance.
+- Final contained artifacts:
+
+  ```text
+  outputs\step_1_4_blend_sweep_full.csv
+    SHA256 0C5B235061E6A2A4858BC70E18E7D00393F741A527DB981FBD80BC9F1F215644
+  logs\cp014_blend_sweep_full_20260809_181209.log
+  ```
+
+- Validation after implementation: 200 tests passed with 15 known warnings;
+  focused Ruff and formatting checks passed.

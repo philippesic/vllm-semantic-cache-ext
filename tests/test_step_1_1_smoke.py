@@ -19,6 +19,7 @@ GPU hardware -- see .claude/docs/semantic-eviction-plan.md Step 1.1 and the
 project memory for that run's result.
 """
 
+import pytest
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
     build_offloading_config,
@@ -166,6 +167,42 @@ def test_spec_extra_config_method_selects_real_scoring_method():
     manager = spec.get_manager()
 
     assert manager._policy._method == "cuboid_mean"
+
+
+def test_spec_extra_config_selects_policy_alpha_without_changing_default():
+    configured = _make_vllm_config(extra_config_overrides={"alpha": 0.6})
+    configured_spec = OffloadingSpecFactory.create_spec(
+        build_offloading_config(configured, _make_kv_cache_config())
+    )
+    default = _make_vllm_config()
+    default_spec = OffloadingSpecFactory.create_spec(
+        build_offloading_config(default, _make_kv_cache_config())
+    )
+
+    assert configured_spec.get_manager()._policy._alpha == 0.6
+    assert default_spec.get_manager()._policy._alpha == 0.5
+
+
+@pytest.mark.parametrize(
+    ("alpha", "error"),
+    [
+        (True, TypeError),
+        ("0.6", TypeError),
+        (None, TypeError),
+        (-0.1, ValueError),
+        (1.1, ValueError),
+        (float("nan"), ValueError),
+        (float("inf"), ValueError),
+    ],
+)
+def test_spec_rejects_invalid_policy_alpha(alpha, error):
+    config = _make_vllm_config(extra_config_overrides={"alpha": alpha})
+    spec = OffloadingSpecFactory.create_spec(
+        build_offloading_config(config, _make_kv_cache_config())
+    )
+
+    with pytest.raises(error, match="alpha"):
+        spec.get_manager()
 
 
 # ---------------------------------------------------------------------------

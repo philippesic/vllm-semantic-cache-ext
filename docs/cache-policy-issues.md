@@ -98,23 +98,34 @@ for active work belong here.
   portable `uv`, isolated CPython/venv/cache paths, manifests, transcripts, and
   a quarantine directory. The bootstrap script is tracked under
   `tools/rtx5080/`.
-- **Next:** install experiment dependencies only into the session venv and keep
-  Linux-only vLLM integration on local/DGX infrastructure.
+- **Next:** keep Linux-only vLLM integration on local/DGX infrastructure.
+  Continue routing every native-Windows model trace through the tracked runner
+  and audit the session root after material dependency or cache changes.
 
 ### CP-014: Fixed relevance/recency blend can erase strong old-block evidence
 
 - **Priority:** P1 policy quality
-- **State:** diagnostic trace found; broader experiment needed
+- **State:** alpha is now a validated experimental opt-in; default remains 0.5
 - **Evidence:** in CP-004's natural traces, all three EMA inputs retained every
   known needle block in relevance-only top-8 and top-16, but the current
   `alpha=0.5` relevance/recency keep-score retained none after placing the
   needles at the oldest positions. The oldest block's maximal relevance and a
   newest block's maximal recency can tie at exactly 0.5, leaving capacity and
-  tie order to dominate a semantically clear case.
-- **Next:** replay identical score/recency traces across capacities and alpha
-  values, then test balanced insertion-order and false-positive controls. Any
-  candidate remains opt-in until the Linux/DGX end-to-end audit checks actual
-  preservation, TTFT, and throughput.
+  tie order to dominate a semantically clear case. A follow-up four-case model
+  trace added explicit semantic decoys, two held-out attention queries, and all
+  nine target/decoy oldest-middle-newest recency combinations. The exact policy
+  simulator matched `SemanticPolicy` in 288/288 random comparisons plus the
+  boundary tie. At capacities 8/16/24, alpha 0.6 improved complete-needle and
+  held-out attention retention over 0.5 without paired attention regressions.
+  Complete stale-decoy gain did not exceed complete-target gain at those
+  capacities. Higher alphas retained progressively more stale semantic decoys.
+- **Change:** `extra_config={"alpha": 0.6}` now reaches the policy, while the
+  default remains 0.5. Non-numeric, non-finite, and out-of-range values fail
+  closed, as does a non-default alpha with `unscored_last`, where alpha has no
+  effect.
+- **Next:** include 0.5 and 0.6 experimental cells in the Linux/DGX end-to-end
+  audit and compare actual CPU-tier preservation, TTFT, throughput, and
+  preemptions before considering any default change.
 
 ## Closed
 

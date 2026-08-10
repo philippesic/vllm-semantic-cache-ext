@@ -253,7 +253,7 @@ def update_ema(ema: torch.Tensor | None, scores: torch.Tensor) -> torch.Tensor:
 def normalized(values: torch.Tensor) -> torch.Tensor:
     span = values.max() - values.min()
     if span <= torch.finfo(values.dtype).eps:
-        return torch.full_like(values, 0.5)
+        return torch.zeros_like(values)
     return (values - values.min()) / span
 
 

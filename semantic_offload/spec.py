@@ -12,6 +12,7 @@ from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
 from semantic_offload._vllm_compat import spec_blocks_per_chunk
 from semantic_offload.manager import SemanticOffloadingManager
+from semantic_offload.policy import DEFAULT_POLICY_ALPHA
 from semantic_offload.worker import SemanticOffloadingWorker
 
 
@@ -64,6 +65,12 @@ class SemanticOffloadingSpec(CPUOffloadingSpec):
             # manager.py's _DEFAULT_METHOD with no way to pick another at
             # launch time (issues log entry #34).
             method = str(self.extra_config.get("method", "mean"))
+            alpha_config = self.extra_config.get("alpha", DEFAULT_POLICY_ALPHA)
+            if isinstance(alpha_config, bool) or not isinstance(
+                alpha_config, (int, float)
+            ):
+                raise TypeError("alpha must be a JSON number")
+            alpha = float(alpha_config)
             self._manager = SemanticOffloadingManager(
                 num_blocks=self.num_blocks,
                 enable_events=self.kv_events_config.enable_kv_cache_events,
@@ -75,5 +82,6 @@ class SemanticOffloadingSpec(CPUOffloadingSpec):
                 session_aware=session_aware,
                 session_bonus_half_life=session_bonus_half_life,
                 method=method,
+                alpha=alpha,
             )
         return self._manager

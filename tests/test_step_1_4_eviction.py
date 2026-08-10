@@ -7,6 +7,7 @@ these tests cover the blending arithmetic and the LRU-equivalence fallback
 in isolation.
 """
 
+import pytest
 from vllm.v1.kv_offload.base import ReqContext, make_offload_key
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus
 
@@ -76,6 +77,41 @@ def test_high_relevance_block_survives_eviction_despite_being_oldest():
 
     assert evicted is not None
     assert evicted[0][0] == old_unimportant
+
+
+def test_alpha_above_half_resolves_relevance_recency_boundary_tie():
+    old_relevant = to_key(10)
+    new_irrelevant = to_key(11)
+
+    def evicted_key(alpha: float):
+        relevance = {"mean": {old_relevant: 1.0, new_irrelevant: 0.0}}
+        policy = SemanticPolicy(
+            cache_capacity=2,
+            relevance_ema=relevance,
+            method="mean",
+            alpha=alpha,
+        )
+        _insert(policy, old_relevant)
+        _insert(policy, new_irrelevant)
+        evicted = policy.evict(1, protected=set())
+        assert evicted is not None
+        return evicted[0][0]
+
+    assert evicted_key(0.0) == old_relevant
+    assert evicted_key(0.5) == old_relevant
+    assert evicted_key(0.6) == new_irrelevant
+    assert evicted_key(1.0) == new_irrelevant
+
+
+@pytest.mark.parametrize("alpha", [-0.1, 1.1, float("nan"), float("inf")])
+def test_policy_rejects_invalid_alpha(alpha: float):
+    with pytest.raises(ValueError, match="alpha"):
+        SemanticPolicy(cache_capacity=1, alpha=alpha)
+
+
+def test_nondefault_alpha_rejects_unscored_last_mode():
+    with pytest.raises(ValueError, match="unscored_last"):
+        SemanticPolicy(cache_capacity=1, alpha=0.6, mode="unscored_last")
 
 
 def test_grace_protected_key_survives_eviction_despite_being_oldest():

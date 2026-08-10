@@ -92,3 +92,39 @@ remain in `.claude/docs/` and the dated audit documents.
 - A containment audit after dependency installation and the model run confirmed
   that `C:\Users\philip\.local` is absent and all persistent session files are
   under the dedicated root (including the quarantined launcher evidence).
+
+## 2026-08-09: Loop 2 — score-calibration trace
+
+- Added a reproducible model-trace experiment comparing the current raw EMA
+  input with tie-aware rank and global query-L2 normalization. All arms preserve
+  the current complete-candidate coverage and rank-weighted EMA update.
+- Added a dedicated PowerShell entry point that invokes the common contained
+  runner. The copied script, Hugging Face cache, venv, CSV output, hashes, and
+  transcripts remain under
+  `C:\Users\philip\semantic-cache-agent\session-20260809`.
+- Ran an initial short-query trace, then a stricter four-case trace with
+  deterministic 0--768-token scaffolds to seek natural query-norm variation.
+  The final run covered 36 query events and 64 candidate blocks per case.
+- Natural query-norm ratios remained narrow (1.058--1.090). Raw and query-L2
+  produced identical natural outcomes, so no normalization implementation or
+  default change is justified.
+- A positive query-scale stress control demonstrated the expected metamorphic
+  property without being treated as workload evidence:
+
+  | Scenario / EMA input | Needle relevance@8 | Attention relevance@8 | Needle policy@8 |
+  |---|---:|---:|---:|
+  | natural / raw | 1.0000 | 0.8438 | 0.0000 |
+  | natural / rank | 1.0000 | 0.8438 | 0.0000 |
+  | natural / query-L2 | 1.0000 | 0.8438 | 0.0000 |
+  | scale stress / raw | 0.0000 | 0.0000 | 0.0000 |
+  | scale stress / rank | 1.0000 | 0.8438 | 0.0000 |
+  | scale stress / query-L2 | 1.0000 | 0.8438 | 0.0000 |
+
+- The final CSV SHA-256 is
+  `D740F00E80154F3AC088BF34836BA703EE47F33EA41F8D1AC0DD9DD1C087A35A`;
+  its transcript is
+  `logs\cp004_score_calibration_full_20260809_175307.log` on the isolated host.
+- Separating relevance-only from policy outcomes exposed a more direct issue:
+  every natural arm kept all needle blocks in relevance-only top-8/top-16, but
+  the fixed 0.5 relevance/recency blend kept none. This is tracked as CP-014;
+  score normalization is not being used to disguise that downstream tradeoff.

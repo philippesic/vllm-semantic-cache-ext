@@ -46,12 +46,20 @@ for active work belong here.
 ### CP-004: Raw score scale is not calibrated across queries
 
 - **Priority:** P1 policy quality
-- **State:** experiment needed
+- **State:** investigated; no implementation justified by natural traces
 - **Evidence:** rank controls EMA weight, but the updated value remains a raw dot
   product. Query-norm variation can therefore change long-lived relevance even
-  when ranking is identical.
-- **Next:** compare raw, rank-normalized, and query-normalized updates using the
-  same offline traces before any default change.
+  when ranking is identical. A four-case, 36-query model trace compared raw,
+  tie-aware rank, and global query-L2-normalized EMA inputs. Deterministic
+  0--768-token query scaffolds produced only 1.058--1.090 within-case query-norm
+  spread, and raw/query-L2 had identical natural pre-policy and final outcomes.
+  Controlled positive query scaling caused raw EMA rankings to collapse while
+  rank/query-L2 remained invariant, proving the mechanism but not that it occurs
+  materially in the measured workload.
+- **Next:** keep raw as the only production behavior. Reopen only if a broader
+  natural trace suite observes materially wider query-norm spread and paired
+  pre-policy gains; synthetic scaling alone is a property test, not a launch
+  gate.
 
 ### CP-005: Hybrid and multi-KV-group layouts cannot use semantic attribution
 
@@ -92,6 +100,21 @@ for active work belong here.
   `tools/rtx5080/`.
 - **Next:** install experiment dependencies only into the session venv and keep
   Linux-only vLLM integration on local/DGX infrastructure.
+
+### CP-014: Fixed relevance/recency blend can erase strong old-block evidence
+
+- **Priority:** P1 policy quality
+- **State:** diagnostic trace found; broader experiment needed
+- **Evidence:** in CP-004's natural traces, all three EMA inputs retained every
+  known needle block in relevance-only top-8 and top-16, but the current
+  `alpha=0.5` relevance/recency keep-score retained none after placing the
+  needles at the oldest positions. The oldest block's maximal relevance and a
+  newest block's maximal recency can tie at exactly 0.5, leaving capacity and
+  tie order to dominate a semantically clear case.
+- **Next:** replay identical score/recency traces across capacities and alpha
+  values, then test balanced insertion-order and false-positive controls. Any
+  candidate remains opt-in until the Linux/DGX end-to-end audit checks actual
+  preservation, TTFT, and throughput.
 
 ## Closed
 

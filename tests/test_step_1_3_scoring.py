@@ -6,13 +6,22 @@ the real server instead; see .claude/docs/semantic-eviction-plan.md Step 1.3
 and the issues log for that investigation).
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.v1.kv_offload.base import make_offload_key
+from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
+from semantic_offload.connector import (
+    SemanticOffloadingConnector,
+    SemanticWorkerMetadata,
+)
 from semantic_offload.index import BlockSummary, score
 from semantic_offload.manager import SemanticOffloadingManager
-from semantic_offload.worker import SemanticOffloadingWorker
+from semantic_offload.worker import SemanticOffloadingWorker, validate_parallel_scoring
 
 
 def _make_worker(
@@ -35,6 +44,7 @@ def _make_worker(
     worker._stack_cache_index = {}
     worker._stack_pending_insert = set()
     worker._stack_pending_remove = set()
+    worker._pending_score_head_counts = {}
     return worker
 
 
@@ -45,6 +55,181 @@ def _summary(value: float, dim: int = 4) -> BlockSummary:
 
 def to_key(n: int):
     return make_offload_key(str(n).encode(), 0)
+
+
+def _worker_metadata(
+    scores: list[tuple[object, float]],
+    *,
+    head_count: int = 1,
+    reduction: str = "mean",
+    group_size: int = 1,
+) -> SemanticWorkerMetadata:
+    return SemanticWorkerMetadata(
+        pending_scores={"mean": {"req": scores}},
+        score_head_counts={"mean": {"req": head_count}},
+        score_worker_counts={"mean": {"req": 1}},
+        score_reduction=reduction,
+        score_group_size=group_size,
+        score_contributors=1,
+    )
+
+
+def test_worker_score_aggregation_is_weighted_and_order_independent():
+    """TP worker arrival order must not select the scheduler's score."""
+    key_a, key_b = to_key(1), to_key(2)
+    workers = [
+        _worker_metadata([(key_a, 1.0), (key_b, 4.0)], head_count=1, group_size=3),
+        _worker_metadata([(key_b, 2.0), (key_a, 7.0)], head_count=2, group_size=3),
+        _worker_metadata([(key_a, 4.0), (key_b, 8.0)], head_count=1, group_size=3),
+    ]
+
+    forward = workers[0].aggregate(workers[1]).aggregate(workers[2])
+    reverse = workers[2].aggregate(workers[1]).aggregate(workers[0])
+
+    assert isinstance(forward, SemanticWorkerMetadata)
+    assert isinstance(reverse, SemanticWorkerMetadata)
+    assert forward.score_head_counts == {"mean": {"req": 4}}
+    assert reverse.score_head_counts == forward.score_head_counts
+    assert forward.complete_scores() == forward.pending_scores
+    assert reverse.complete_scores() == reverse.pending_scores
+    assert dict(forward.pending_scores["mean"]["req"]) == pytest.approx(
+        {key_a: 4.75, key_b: 4.0}
+    )
+    assert dict(reverse.pending_scores["mean"]["req"]) == pytest.approx(
+        dict(forward.pending_scores["mean"]["req"])
+    )
+    assert forward.pending_scores["mean"]["req"][0][0] == key_a
+
+
+def test_worker_score_aggregation_max_reduces_across_head_shards():
+    key_a, key_b = to_key(1), to_key(2)
+    left = _worker_metadata([(key_a, 1.0), (key_b, 5.0)], reduction="max", group_size=2)
+    right = _worker_metadata(
+        [(key_a, 7.0), (key_b, 3.0)], reduction="max", group_size=2
+    )
+
+    merged = left.aggregate(right)
+
+    assert isinstance(merged, SemanticWorkerMetadata)
+    assert merged.pending_scores["mean"]["req"] == [
+        (key_a, 7.0),
+        (key_b, 5.0),
+    ]
+
+
+def test_worker_score_aggregation_drops_incomplete_candidates():
+    """A candidate missing a head shard has no valid global score."""
+    key_a, key_b = to_key(1), to_key(2)
+    left = _worker_metadata([(key_a, 4.0), (key_b, 3.0)], group_size=2)
+    right = _worker_metadata([(key_b, 5.0)], group_size=2)
+
+    merged = left.aggregate(right)
+
+    assert isinstance(merged, SemanticWorkerMetadata)
+    assert merged.pending_scores["mean"]["req"] == [(key_b, 4.0)]
+
+
+def test_worker_score_aggregation_breaks_score_ties_by_key():
+    """Equal global scores must not reintroduce worker-order dependence."""
+    key_a, key_b = to_key(1), to_key(2)
+    left = _worker_metadata([(key_b, 1.0), (key_a, 3.0)], group_size=2)
+    right = _worker_metadata([(key_a, 1.0), (key_b, 3.0)], group_size=2)
+
+    merged = left.aggregate(right)
+
+    assert isinstance(merged, SemanticWorkerMetadata)
+    assert merged.pending_scores["mean"]["req"] == [
+        (min(key_a, key_b), 2.0),
+        (max(key_a, key_b), 2.0),
+    ]
+
+
+class _WorkerOutput(ModelRunnerOutput):
+    def __init__(self, metadata: SemanticWorkerMetadata):
+        self.kv_connector_output = KVConnectorOutput(kv_connector_worker_meta=metadata)
+
+
+def test_output_aggregator_discards_request_missing_a_worker_contribution():
+    """An empty TP rank must make a partial-head request score unusable."""
+    key = to_key(1)
+    scoring = _worker_metadata([(key, 4.0)], group_size=2)
+    empty = SemanticWorkerMetadata(
+        score_reduction="mean",
+        score_group_size=2,
+        score_contributors=1,
+    )
+
+    output = KVOutputAggregator(expected_finished_count=2).aggregate(
+        [_WorkerOutput(scoring), _WorkerOutput(empty)]
+    )
+
+    assert output is not None
+    metadata = output.kv_connector_output.kv_connector_worker_meta
+    assert isinstance(metadata, SemanticWorkerMetadata)
+    assert metadata.score_contributors == 2
+    assert metadata.complete_scores() == {}
+
+
+def test_parallel_scoring_rejects_unsupported_layouts():
+    with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
+        validate_parallel_scoring(1, 2, 8, "mean", "mean")
+    with pytest.raises(ValueError, match="Replicated KV heads"):
+        validate_parallel_scoring(4, 1, 2, "minmax", "mean")
+    with pytest.raises(ValueError, match="Replicated KV heads"):
+        validate_parallel_scoring(4, 1, 2, "mean", "max")
+    with pytest.raises(ValueError, match="prefill_context_parallel_size=1"):
+        validate_parallel_scoring(
+            2, 1, 8, "mean", "mean", prefill_context_parallel_size=2
+        )
+    with pytest.raises(ValueError, match="decode_context_parallel_size=1"):
+        validate_parallel_scoring(
+            2, 1, 8, "mean", "mean", decode_context_parallel_size=2
+        )
+    with pytest.raises(ValueError, match="world_size to equal"):
+        validate_parallel_scoring(2, 1, 8, "mean", "mean", world_size=4)
+    with pytest.raises(ValueError, match="support MLA"):
+        validate_parallel_scoring(1, 1, 1, "mean", "mean", use_mla=True)
+
+
+def test_parallel_scoring_allows_supported_tp_layouts():
+    validate_parallel_scoring(2, 1, 8, "minmax", "max")
+    validate_parallel_scoring(4, 1, 2, "mean", "mean")
+
+
+@pytest.mark.parametrize(
+    ("parallel_overrides", "use_mla", "message"),
+    [
+        ({"pipeline_parallel_size": 2, "world_size": 2}, False, "pipeline"),
+        (
+            {"prefill_context_parallel_size": 2, "world_size": 2},
+            False,
+            "prefill_context",
+        ),
+        ({"decode_context_parallel_size": 2}, False, "decode_context"),
+        ({"world_size": 2}, False, "world_size"),
+        ({}, True, "MLA"),
+    ],
+)
+def test_connector_construction_rejects_unsupported_score_topology(
+    parallel_overrides, use_mla, message
+):
+    parallel = {
+        "pipeline_parallel_size": 1,
+        "tensor_parallel_size": 1,
+        "prefill_context_parallel_size": 1,
+        "decode_context_parallel_size": 1,
+        "world_size": 1,
+    }
+    parallel.update(parallel_overrides)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(**parallel),
+        model_config=SimpleNamespace(use_mla=use_mla),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        SemanticOffloadingConnector(
+            config, KVConnectorRole.WORKER, kv_cache_config=None
+        )
 
 
 def _seed_durable_summaries(worker, mapping) -> None:

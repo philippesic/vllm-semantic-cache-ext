@@ -83,6 +83,8 @@ if TYPE_CHECKING:
 
 # method -> req_id -> list[(offload_key, score)]
 RelevanceScores = dict[str, dict[str, list[tuple[OffloadKey, float]]]]
+ScoreHeadCounts = dict[str, dict[str, int]]
+ScoreWorkerCounts = dict[str, dict[str, int]]
 
 # Step 1.5 (semantic prefetch, see .claude/docs/semantic-eviction-plan.md and
 # issues log entries #23-#24). Bound on total GPU blocks any request's
@@ -149,17 +151,123 @@ class SemanticOffloadingConnectorMetadata(OffloadingConnectorMetadata):
 @dataclass
 class SemanticWorkerMetadata(OffloadingWorkerMetadata):
     pending_scores: RelevanceScores = field(default_factory=dict)
+    score_head_counts: ScoreHeadCounts = field(default_factory=dict)
+    score_worker_counts: ScoreWorkerCounts = field(default_factory=dict)
+    score_reduction: str | None = None
+    score_group_size: int | None = None
+    score_contributors: int = 0
     # splice_id -> number of workers that have completed the GPU copy.
     completed_splices: dict[int, int] = field(default_factory=dict)
+
+    def complete_scores(self) -> RelevanceScores:
+        """Return only requests scored by the complete worker group."""
+        if (
+            self.score_group_size is None
+            or self.score_contributors != self.score_group_size
+        ):
+            return {}
+        complete: RelevanceScores = {}
+        for method, reqs in self.pending_scores.items():
+            complete_reqs = {
+                req_id: ranked
+                for req_id, ranked in reqs.items()
+                if self.score_worker_counts.get(method, {}).get(req_id, 0)
+                == self.score_group_size
+            }
+            if complete_reqs:
+                complete[method] = complete_reqs
+        return complete
 
     def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetadata:
         assert isinstance(other, OffloadingWorkerMetadata)
         base = super().aggregate(other)
         merged_scores: RelevanceScores = {
-            method: dict(reqs) for method, reqs in self.pending_scores.items()
+            method: {req_id: list(ranked) for req_id, ranked in reqs.items()}
+            for method, reqs in self.pending_scores.items()
         }
-        for method, reqs in getattr(other, "pending_scores", {}).items():
-            merged_scores.setdefault(method, {}).update(reqs)
+        merged_counts: ScoreHeadCounts = {
+            method: dict(reqs) for method, reqs in self.score_head_counts.items()
+        }
+        merged_worker_counts: ScoreWorkerCounts = {
+            method: dict(reqs) for method, reqs in self.score_worker_counts.items()
+        }
+        other_scores = getattr(other, "pending_scores", {})
+        other_head_counts = getattr(other, "score_head_counts", {})
+        other_worker_counts = getattr(other, "score_worker_counts", {})
+        other_reduction = getattr(other, "score_reduction", None)
+        other_group_size = getattr(other, "score_group_size", None)
+        group_sizes = {
+            size
+            for size in (self.score_group_size, other_group_size)
+            if size is not None
+        }
+        if len(group_sizes) > 1:
+            raise ValueError(
+                f"Cannot aggregate semantic score groups of different sizes: "
+                f"{sorted(group_sizes)}"
+            )
+        score_group_size = next(iter(group_sizes), None)
+        score_contributors = self.score_contributors + getattr(
+            other, "score_contributors", 0
+        )
+        if self.pending_scores:
+            score_reduction = self.score_reduction or "mean"
+        elif other_scores:
+            score_reduction = other_reduction or "mean"
+        else:
+            score_reduction = self.score_reduction or other_reduction
+        if self.pending_scores and other_scores:
+            left_reduction = self.score_reduction or "mean"
+            right_reduction = other_reduction or "mean"
+            if left_reduction != right_reduction:
+                raise ValueError(
+                    "Cannot aggregate semantic scores with different head "
+                    f"reductions: {left_reduction!r} and {right_reduction!r}"
+                )
+            score_reduction = left_reduction
+
+        for method, reqs in other_scores.items():
+            method_scores = merged_scores.setdefault(method, {})
+            method_counts = merged_counts.setdefault(method, {})
+            method_worker_counts = merged_worker_counts.setdefault(method, {})
+            for req_id, ranked in reqs.items():
+                right_count = other_head_counts.get(method, {}).get(req_id, 1)
+                right_worker_count = other_worker_counts.get(method, {}).get(req_id, 1)
+                if req_id not in method_scores:
+                    method_scores[req_id] = list(ranked)
+                    method_counts[req_id] = right_count
+                    method_worker_counts[req_id] = right_worker_count
+                    continue
+
+                left_count = method_counts.get(req_id, 1)
+                left_worker_count = method_worker_counts.get(req_id, 1)
+                left_scores = dict(method_scores[req_id])
+                right_scores = dict(ranked)
+                common_keys = left_scores.keys() & right_scores.keys()
+                reduction = score_reduction or "mean"
+                if reduction == "mean":
+                    total_count = left_count + right_count
+                    combined = {
+                        key: (
+                            left_scores[key] * left_count
+                            + right_scores[key] * right_count
+                        )
+                        / total_count
+                        for key in common_keys
+                    }
+                elif reduction == "max":
+                    total_count = left_count + right_count
+                    combined = {
+                        key: max(left_scores[key], right_scores[key])
+                        for key in common_keys
+                    }
+                else:
+                    raise ValueError(f"Unknown score reduction: {reduction!r}")
+                method_scores[req_id] = sorted(
+                    combined.items(), key=lambda item: (-item[1], item[0])
+                )
+                method_counts[req_id] = total_count
+                method_worker_counts[req_id] = left_worker_count + right_worker_count
         completed_splices = dict(self.completed_splices)
         for splice_id, count in getattr(other, "completed_splices", {}).items():
             completed_splices[splice_id] = completed_splices.get(splice_id, 0) + count
@@ -167,6 +275,11 @@ class SemanticWorkerMetadata(OffloadingWorkerMetadata):
             completed_jobs=base.completed_jobs,
             transfer_stats=base.transfer_stats,
             pending_scores=merged_scores,
+            score_head_counts=merged_counts,
+            score_worker_counts=merged_worker_counts,
+            score_reduction=score_reduction,
+            score_group_size=score_group_size,
+            score_contributors=score_contributors,
             completed_splices=completed_splices,
         )
 
@@ -901,6 +1014,31 @@ class SemanticOffloadingConnector(OffloadingConnector):
         role: KVConnectorRole,
         kv_cache_config: KVCacheConfig,
     ):
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.pipeline_parallel_size != 1:
+            raise ValueError(
+                "Semantic offloading currently requires pipeline_parallel_size=1; "
+                "pipeline stages do not yet share one global probe-layer identity"
+            )
+        if getattr(parallel_config, "prefill_context_parallel_size", 1) != 1:
+            raise ValueError(
+                "Semantic offloading currently requires prefill_context_parallel_size=1"
+            )
+        if getattr(parallel_config, "decode_context_parallel_size", 1) != 1:
+            raise ValueError(
+                "Semantic offloading currently requires decode_context_parallel_size=1"
+            )
+        if (
+            getattr(parallel_config, "world_size", parallel_config.tensor_parallel_size)
+            != parallel_config.tensor_parallel_size
+        ):
+            raise ValueError(
+                "Semantic offloading worker aggregation requires world_size to "
+                "equal tensor_parallel_size"
+            )
+        if bool(getattr(vllm_config.model_config, "use_mla", False)):
+            raise ValueError("Semantic offloading does not yet support MLA KV caches")
+        self._score_group_size = parallel_config.tensor_parallel_size
         # Deliberately skip OffloadingConnector.__init__ (calling
         # KVConnectorBase_V1.__init__ directly instead): the base __init__
         # would construct its own OffloadingConnectorScheduler around a spec
@@ -975,27 +1113,41 @@ class SemanticOffloadingConnector(OffloadingConnector):
         assert self.connector_worker is not None
         worker = self.connector_worker.worker
         scores: RelevanceScores = {}
-        if hasattr(worker, "pop_pending_scores"):
-            scores = worker.pop_pending_scores()
+        score_head_counts: ScoreHeadCounts = {}
+        score_reduction = None
+        if hasattr(worker, "pop_pending_score_metadata"):
+            scores, score_head_counts, score_reduction = (
+                worker.pop_pending_score_metadata()
+            )
+        else:
+            raise TypeError("Semantic worker does not provide versioned score metadata")
+        score_worker_counts: ScoreWorkerCounts = {
+            method: {req_id: 1 for req_id in reqs} for method, reqs in scores.items()
+        }
         completed_splices = {}
         if hasattr(worker, "pop_completed_splices"):
             completed_splices = {
                 splice_id: 1 for splice_id in worker.pop_completed_splices()
             }
-        if not scores and not completed_splices:
-            return base_meta
         base_meta = base_meta or OffloadingWorkerMetadata()
         assert isinstance(base_meta, OffloadingWorkerMetadata)
         return SemanticWorkerMetadata(
             completed_jobs=base_meta.completed_jobs,
             transfer_stats=base_meta.transfer_stats,
             pending_scores=scores,
+            score_head_counts=score_head_counts,
+            score_worker_counts=score_worker_counts,
+            score_reduction=score_reduction,
+            score_group_size=self._score_group_size,
+            score_contributors=1,
             completed_splices=completed_splices,
         )
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         meta = connector_output.kv_connector_worker_meta
-        scores = getattr(meta, "pending_scores", None)
+        scores = (
+            meta.complete_scores() if isinstance(meta, SemanticWorkerMetadata) else None
+        )
         super().update_connector_output(connector_output)
         if scores and self.connector_scheduler is not None:
             manager = self.connector_scheduler.manager

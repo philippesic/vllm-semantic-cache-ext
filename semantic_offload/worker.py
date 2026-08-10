@@ -81,6 +81,50 @@ _METHOD_FIELDS = {
 }
 
 
+def validate_parallel_scoring(
+    tensor_parallel_size: int,
+    pipeline_parallel_size: int,
+    total_num_kv_heads: int | None,
+    method: str,
+    head_aggregation: str,
+    prefill_context_parallel_size: int = 1,
+    decode_context_parallel_size: int = 1,
+    world_size: int | None = None,
+    use_mla: bool = False,
+) -> None:
+    if pipeline_parallel_size != 1:
+        raise ValueError(
+            "Semantic offloading currently requires pipeline_parallel_size=1"
+        )
+    if prefill_context_parallel_size != 1:
+        raise ValueError(
+            "Semantic offloading currently requires prefill_context_parallel_size=1"
+        )
+    if decode_context_parallel_size != 1:
+        raise ValueError(
+            "Semantic offloading currently requires decode_context_parallel_size=1"
+        )
+    if world_size is not None and world_size != tensor_parallel_size:
+        raise ValueError(
+            "Semantic offloading worker aggregation requires world_size to equal "
+            "tensor_parallel_size"
+        )
+    if use_mla:
+        raise ValueError("Semantic offloading does not yet support MLA KV caches")
+    replicated_kv_heads = (
+        total_num_kv_heads is None or tensor_parallel_size > total_num_kv_heads
+    )
+    if (
+        tensor_parallel_size > 1
+        and replicated_kv_heads
+        and (method != "mean" or head_aggregation != "mean")
+    ):
+        raise ValueError(
+            "Replicated KV heads are only supported with method='mean' and "
+            "head_aggregation='mean'"
+        )
+
+
 def select_probe_layer(layer_names, selection: str | int = "middle") -> str | None:
     """Select a probe layer by natural model order or exact name."""
     names = list(layer_names)
@@ -149,6 +193,30 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
                 f"Supported: {_HEAD_AGGREGATIONS}"
             )
         self._head_aggregation = head_aggregation
+        parallel_config = vllm_config.parallel_config
+        get_total_num_kv_heads = getattr(
+            vllm_config.model_config, "get_total_num_kv_heads", None
+        )
+        total_num_kv_heads = (
+            get_total_num_kv_heads() if get_total_num_kv_heads is not None else None
+        )
+        validate_parallel_scoring(
+            tensor_parallel_size=parallel_config.tensor_parallel_size,
+            pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+            total_num_kv_heads=total_num_kv_heads,
+            method=method,
+            head_aggregation=head_aggregation,
+            prefill_context_parallel_size=(
+                getattr(parallel_config, "prefill_context_parallel_size", 1)
+            ),
+            decode_context_parallel_size=getattr(
+                parallel_config, "decode_context_parallel_size", 1
+            ),
+            world_size=getattr(
+                parallel_config, "world_size", parallel_config.tensor_parallel_size
+            ),
+            use_mla=bool(getattr(vllm_config.model_config, "use_mla", False)),
+        )
         static_forward_context = vllm_config.compilation_config.static_forward_context
         self._attention_layers = {
             layer_name: layer
@@ -197,6 +265,7 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         self._pending_job_keys: dict[int, list[OffloadKey]] = {}
         self._pending_job_blocks: dict[int, list[tuple[OffloadKey, list[int]]]] = {}
         self._pending_scores: dict[str, dict[str, list[tuple[OffloadKey, float]]]] = {}
+        self._pending_score_head_counts: dict[str, dict[str, int]] = {}
         # Cache of durable_summaries stacked into batched tensors, kept in
         # sync incrementally (see _rebuild_stack_cache) rather than rebuilt
         # from scratch on every query capture -- query captures fire on
@@ -259,6 +328,7 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
         self._pending_job_keys.clear()
         self._pending_job_blocks.clear()
         self._pending_scores.clear()
+        self._pending_score_head_counts.clear()
         self._stack_cache_dirty = True
         self._stack_cache_keys.clear()
         self._stack_cache.clear()
@@ -312,9 +382,21 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
     def pop_pending_scores(
         self,
     ) -> dict[str, dict[str, list[tuple[OffloadKey, float]]]]:
-        scores = self._pending_scores
-        self._pending_scores = {}
+        scores, _, _ = self.pop_pending_score_metadata()
         return scores
+
+    def pop_pending_score_metadata(
+        self,
+    ) -> tuple[
+        dict[str, dict[str, list[tuple[OffloadKey, float]]]],
+        dict[str, dict[str, int]],
+        str,
+    ]:
+        scores = self._pending_scores
+        head_counts = getattr(self, "_pending_score_head_counts", {})
+        self._pending_scores = {}
+        self._pending_score_head_counts = {}
+        return scores, head_counts, self._head_aggregation
 
     def _rebuild_stack_cache(self) -> None:
         """Bring the stacked-tensor cache back in sync with
@@ -470,9 +552,15 @@ class SemanticOffloadingWorker(CPUOffloadingWorker):
             record_timing("query_captured_sync", time.perf_counter() - _t_sync)
         _t_rank = time.perf_counter() if _TIMING else 0.0
         method_scores = self._pending_scores.setdefault(self._method, {})
+        head_counts = getattr(self, "_pending_score_head_counts", None)
+        if head_counts is None:
+            head_counts = {}
+            self._pending_score_head_counts = head_counts
+        method_head_counts = head_counts.setdefault(self._method, {})
         for req_id, scores in zip(req_ids, all_scores):
-            ranked = sorted(zip(keys, scores), key=lambda kv: kv[1], reverse=True)
+            ranked = sorted(zip(keys, scores), key=lambda kv: (-kv[1], kv[0]))
             method_scores[req_id] = ranked
+            method_head_counts[req_id] = per_head.shape[-1]
             debug_print(
                 f"SEMANTIC_STEP1_3_DEBUG req={req_id} method={self._method} "
                 f"n_summaries={len(self.durable_summaries)} "

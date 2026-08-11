@@ -151,7 +151,7 @@ for active work belong here.
 ### CP-014: Fixed relevance/recency blend can erase strong old-block evidence
 
 - **Priority:** P1 policy quality
-- **State:** alpha is now a validated experimental opt-in; default remains 0.5
+- **State:** paired audit arm implemented locally; default remains 0.5
 - **Evidence:** in CP-004's natural traces, all three EMA inputs retained every
   known needle block in relevance-only top-8 and top-16, but the current
   `alpha=0.5` relevance/recency keep-score retained none after placing the
@@ -168,10 +168,15 @@ for active work belong here.
 - **Change:** `extra_config={"alpha": 0.6}` now reaches the policy, while the
   default remains 0.5. Non-numeric, non-finite, and out-of-range values fail
   closed, as does a non-default alpha with `unscored_last`, where alpha has no
-  effect.
-- **Next:** include 0.5 and 0.6 experimental cells in the Linux/DGX end-to-end
-  audit and compare actual CPU-tier preservation, TTFT, throughput, and
-  preemptions before considering any default change.
+  effect. The DGX audit now makes alpha 0.5 explicit, runs a separately labeled
+  alpha 0.6 arm with identical seed/workload settings, persists exact per-arm
+  config and repository state, and emits seed-level paired preservation,
+  latency, throughput, byte, and preemption deltas. Reused output roots,
+  manifest/CLI seed disagreement, and repository drift fail closed.
+- **Next:** run the expanded Linux/DGX audit, then confirm alpha 0.5 versus 0.6
+  on one isolated GPU with ref1/ref2 plus standalone chat/RAG before considering
+  any default change. The concurrent ref1 screen remains provisional and does
+  not justify a production change by itself.
 
 ## Closed
 

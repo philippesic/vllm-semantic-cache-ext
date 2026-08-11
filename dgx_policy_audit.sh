@@ -7,6 +7,21 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR"
 
+repo_revision() {
+  git -C "$1" rev-parse HEAD
+}
+
+repo_state_fingerprint() {
+  (
+    cd "$1"
+    {
+      git rev-parse HEAD
+      git diff HEAD --binary
+      git ls-files --others --exclude-standard -z | sort -z | xargs -0 sha256sum --
+    } | sha256sum | cut -d' ' -f1
+  )
+}
+
 VLLM_REPO=${VLLM_REPO:-/raid/ppesic/tmp/vllm-semantic-cache}
 VENV_DIR=${VENV_DIR:-"$VLLM_REPO/.venv"}
 if [[ ! -f "$VENV_DIR/bin/activate" ]]; then
@@ -32,7 +47,6 @@ ABLATION_PROMPTS=${ABLATION_PROMPTS:-24}
 CELL_TIMEOUT_S=${CELL_TIMEOUT_S:-7200}
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_ROOT=${OUTPUT_ROOT:-"$SCRIPT_DIR/dgx_logs/policy_audit_$TIMESTAMP"}
-mkdir -p "$OUTPUT_ROOT"
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
   echo "Missing executable Python environment: $PYTHON_BIN" >&2
@@ -47,16 +61,40 @@ if [[ ! -d "$VLLM_REPO/vllm" ]]; then
   exit 2
 fi
 
+# Claim the run directory atomically after preflight. Plain mkdir, rather than
+# an existence check followed by mkdir -p, prevents concurrent launches from
+# ever sharing one evidence root.
+mkdir -p "$(dirname "$OUTPUT_ROOT")"
+if ! mkdir "$OUTPUT_ROOT"; then
+  echo "Refusing to reuse existing audit output root: $OUTPUT_ROOT" >&2
+  echo "Choose a new OUTPUT_ROOT so manifests and results cannot mix across runs." >&2
+  exit 2
+fi
+
+SEMANTIC_REVISION_START=$(repo_revision "$SCRIPT_DIR")
+VLLM_REVISION_START=$(repo_revision "$VLLM_REPO")
+SEMANTIC_STATE_START=$(repo_state_fingerprint "$SCRIPT_DIR")
+VLLM_STATE_START=$(repo_state_fingerprint "$VLLM_REPO")
+{
+  echo "semantic_revision_start=$SEMANTIC_REVISION_START"
+  echo "semantic_state_start=$SEMANTIC_STATE_START"
+  echo "vllm_revision_start=$VLLM_REVISION_START"
+  echo "vllm_state_start=$VLLM_STATE_START"
+} >"$OUTPUT_ROOT/repository_state.txt"
+
 export PYTHONPATH="$SCRIPT_DIR:$VLLM_REPO${PYTHONPATH:+:$PYTHONPATH}"
 export VLLM_CLI
-export PATH="$(dirname "$VLLM_CLI"):$PATH"
+VLLM_CLI_DIR=$(dirname "$VLLM_CLI")
+export PATH="$VLLM_CLI_DIR:$PATH"
 export SEMANTIC_OFFLOAD_TIMING=${SEMANTIC_OFFLOAD_TIMING:-1}
 export SEMANTIC_OFFLOAD_TIMING_EVERY=${SEMANTIC_OFFLOAD_TIMING_EVERY:-500}
 export NEEDLE_SHARED_CONTENT=1
 
 {
-  echo "semantic_repo=$(git rev-parse HEAD)"
-  echo "vllm_repo=$(git -C "$VLLM_REPO" rev-parse HEAD)"
+  echo "semantic_repo=$SEMANTIC_REVISION_START"
+  echo "semantic_state=$SEMANTIC_STATE_START"
+  echo "vllm_repo=$VLLM_REVISION_START"
+  echo "vllm_state=$VLLM_STATE_START"
   echo "model=$MODEL"
   echo "python_bin=$PYTHON_BIN"
   echo "venv_dir=$VENV_DIR"
@@ -95,11 +133,61 @@ AUDIT_FAILED=0
 run_grid() {
   local variant=$1
   shift
+  local variant_dir="$OUTPUT_ROOT/$variant"
+  local -a variant_args=("${COMMON_ARGS[@]}" --output-dir "$variant_dir" "$@")
+  local semantic_revision_start vllm_revision_start
+  local semantic_state_start vllm_state_start
+  semantic_revision_start=$(repo_revision "$SCRIPT_DIR")
+  vllm_revision_start=$(repo_revision "$VLLM_REPO")
+  semantic_state_start=$(repo_state_fingerprint "$SCRIPT_DIR")
+  vllm_state_start=$(repo_state_fingerprint "$VLLM_REPO")
+  mkdir -p "$variant_dir"
+  {
+    printf 'variant=%s\n' "$variant"
+    printf 'python_bin=%s\n' "$PYTHON_BIN"
+    printf 'semantic_revision_start=%s\n' "$semantic_revision_start"
+    printf 'semantic_state_start=%s\n' "$semantic_state_start"
+    printf 'vllm_revision_start=%s\n' "$vllm_revision_start"
+    printf 'vllm_state_start=%s\n' "$vllm_state_start"
+    local option value
+    for option in --policies --workloads --request-rates \
+      --needle-reference-counts --num-prompts --target-duration-s \
+      --seeds --gpus --extra-config; do
+      value=""
+      local i
+      for ((i = 0; i < ${#variant_args[@]} - 1; i++)); do
+        if [[ "${variant_args[$i]}" == "$option" ]]; then
+          value=${variant_args[$((i + 1))]}
+        fi
+      done
+      printf '%s=%s\n' "${option#--}" "$value"
+    done
+    printf 'command='
+    printf '%q ' "$PYTHON_BIN" benchmarks/run_grid_sweep.py "${variant_args[@]}"
+    printf '\n'
+  } >"$variant_dir/variant_manifest.txt"
   echo "Running variant=$variant"
   if ! "$PYTHON_BIN" benchmarks/run_grid_sweep.py \
-    "${COMMON_ARGS[@]}" \
-    --output-dir "$OUTPUT_ROOT/$variant" \
-    "$@" 2>&1 | tee "$OUTPUT_ROOT/${variant}.log"; then
+    "${variant_args[@]}" 2>&1 | tee "$OUTPUT_ROOT/${variant}.log"; then
+    AUDIT_FAILED=1
+  fi
+  local semantic_revision_end vllm_revision_end
+  local semantic_state_end vllm_state_end
+  semantic_revision_end=$(repo_revision "$SCRIPT_DIR")
+  vllm_revision_end=$(repo_revision "$VLLM_REPO")
+  semantic_state_end=$(repo_state_fingerprint "$SCRIPT_DIR")
+  vllm_state_end=$(repo_state_fingerprint "$VLLM_REPO")
+  {
+    printf 'semantic_revision_end=%s\n' "$semantic_revision_end"
+    printf 'semantic_state_end=%s\n' "$semantic_state_end"
+    printf 'vllm_revision_end=%s\n' "$vllm_revision_end"
+    printf 'vllm_state_end=%s\n' "$vllm_state_end"
+  } >>"$variant_dir/variant_manifest.txt"
+  if [[ "$semantic_revision_start" != "$semantic_revision_end" ||
+    "$semantic_state_start" != "$semantic_state_end" ||
+    "$vllm_revision_start" != "$vllm_revision_end" ||
+    "$vllm_state_start" != "$vllm_state_end" ]]; then
+    echo "Repository state changed while variant=$variant was running" >&2
     AUDIT_FAILED=1
   fi
 }
@@ -127,7 +215,8 @@ echo "[4/4] Running controlled semantic-mean ablations"
 declare -A ABLATIONS=(
   [signal_first_max]='{"probe_layer":"first","head_aggregation":"max","prefetch_budget_fraction":0}'
   [signal_middle_max]='{"probe_layer":"middle","head_aggregation":"max","prefetch_budget_fraction":0}'
-  [signal_middle_mean]='{"probe_layer":"middle","head_aggregation":"mean","prefetch_budget_fraction":0}'
+  [signal_middle_mean]='{"probe_layer":"middle","head_aggregation":"mean","alpha":0.5,"prefetch_budget_fraction":0}'
+  [signal_middle_mean_alpha06]='{"probe_layer":"middle","head_aggregation":"mean","alpha":0.6,"prefetch_budget_fraction":0}'
   [session_decay8]='{"probe_layer":"middle","head_aggregation":"mean","session_aware":true,"session_bonus_half_life":8,"prefetch_budget_fraction":0}'
   [prefetch_001]='{"probe_layer":"middle","head_aggregation":"mean","prefetch_budget_fraction":0.01}'
   [prefetch_005]='{"probe_layer":"middle","head_aggregation":"mean","prefetch_budget_fraction":0.05}'
@@ -135,7 +224,8 @@ declare -A ABLATIONS=(
 )
 
 for variant in \
-  signal_first_max signal_middle_max signal_middle_mean session_decay8 \
+  signal_first_max signal_middle_max signal_middle_mean \
+  signal_middle_mean_alpha06 session_decay8 \
   prefetch_001 prefetch_005 capture_stride4; do
   run_grid "$variant" \
     --policies semantic-mean \
@@ -146,8 +236,46 @@ for variant in \
     --extra-config "${ABLATIONS[$variant]}"
 done
 
+SEMANTIC_REVISION_END=$(repo_revision "$SCRIPT_DIR")
+VLLM_REVISION_END=$(repo_revision "$VLLM_REPO")
+SEMANTIC_STATE_END=$(repo_state_fingerprint "$SCRIPT_DIR")
+VLLM_STATE_END=$(repo_state_fingerprint "$VLLM_REPO")
+{
+  echo "semantic_revision_end=$SEMANTIC_REVISION_END"
+  echo "semantic_state_end=$SEMANTIC_STATE_END"
+  echo "vllm_revision_end=$VLLM_REVISION_END"
+  echo "vllm_state_end=$VLLM_STATE_END"
+} >>"$OUTPUT_ROOT/repository_state.txt"
+if [[ "$SEMANTIC_REVISION_START" != "$SEMANTIC_REVISION_END" ||
+  "$SEMANTIC_STATE_START" != "$SEMANTIC_STATE_END" ||
+  "$VLLM_REVISION_START" != "$VLLM_REVISION_END" ||
+  "$VLLM_STATE_START" != "$VLLM_STATE_END" ]]; then
+  echo "Repository state changed during the audit; results are not comparable" >&2
+  AUDIT_FAILED=1
+fi
+
 if ! "$PYTHON_BIN" benchmarks/summarize_policy_audit.py \
-  "$OUTPUT_ROOT" --expected-seeds "$SEEDS"; then
+  "$OUTPUT_ROOT" --expected-seeds "$SEEDS" --pre-summary; then
+  AUDIT_FAILED=1
+  "$PYTHON_BIN" benchmarks/summarize_policy_audit.py \
+    "$OUTPUT_ROOT" --expected-seeds "$SEEDS" --pre-summary --allow-errors || true
+fi
+
+SEMANTIC_REVISION_SUMMARY_END=$(repo_revision "$SCRIPT_DIR")
+VLLM_REVISION_SUMMARY_END=$(repo_revision "$VLLM_REPO")
+SEMANTIC_STATE_SUMMARY_END=$(repo_state_fingerprint "$SCRIPT_DIR")
+VLLM_STATE_SUMMARY_END=$(repo_state_fingerprint "$VLLM_REPO")
+{
+  echo "semantic_revision_summary_end=$SEMANTIC_REVISION_SUMMARY_END"
+  echo "semantic_state_summary_end=$SEMANTIC_STATE_SUMMARY_END"
+  echo "vllm_revision_summary_end=$VLLM_REVISION_SUMMARY_END"
+  echo "vllm_state_summary_end=$VLLM_STATE_SUMMARY_END"
+} >>"$OUTPUT_ROOT/repository_state.txt"
+if [[ "$SEMANTIC_REVISION_START" != "$SEMANTIC_REVISION_SUMMARY_END" ||
+  "$SEMANTIC_STATE_START" != "$SEMANTIC_STATE_SUMMARY_END" ||
+  "$VLLM_REVISION_START" != "$VLLM_REVISION_SUMMARY_END" ||
+  "$VLLM_STATE_START" != "$VLLM_STATE_SUMMARY_END" ]]; then
+  echo "Repository state changed during summary generation" >&2
   AUDIT_FAILED=1
   "$PYTHON_BIN" benchmarks/summarize_policy_audit.py \
     "$OUTPUT_ROOT" --expected-seeds "$SEEDS" --allow-errors || true

@@ -272,3 +272,30 @@ remain in `.claude/docs/` and the dated audit documents.
   requires a lifetime-authenticated supervisor spanning cells, servers, and
   benchmark clients, with bounded controlled unwinding and synthetic
   descendant tests. No partial signal/PGID patch remains in the worktree.
+
+## 2026-08-10: Loop 7 — paired alpha audit evidence
+
+- Added an explicit alpha 0.5 control and a separately labeled alpha 0.6
+  semantic-mean arm to the fail-closed DGX audit. Both use the same middle probe,
+  mean head aggregation, disabled prefetch, seeds, workloads, rates, and GPU
+  allocation; alpha 0.6 remains experimental and the production default stays
+  0.5.
+- Every variant now records its exact command/config and seed contract. The
+  summarizer requires the expanded 99-row-per-seed matrix, rejects mislabeled
+  alpha configs and seed overrides, and writes exact seed-level outcomes and
+  alpha-0.6-minus-alpha-0.5 deltas to `alpha_paired_seed_deltas.csv`.
+- Audit output roots are acquired with atomic `mkdir` and cannot be reused, so
+  stale results cannot be relabeled by a later failed run. A two-process
+  regression proves only one concurrent launch can claim a path.
+- The runner fingerprints both semantic and vLLM revisions/worktrees at the
+  whole-run and per-variant boundaries. Shell execution marks drift as failure,
+  and the summarizer independently rejects missing, changed, or cross-variant
+  repository state.
+- The concurrent alpha arm is a screen, not a default-change gate: it covers
+  ref1 plus chat/RAG and shares DGX host resources. A clean isolated one-GPU
+  alpha 0.5/0.6 confirmation must add ref2 before any production decision.
+- Final local validation: 233 tests passed with 15 known warnings; `bash -n`,
+  ShellCheck, focused Ruff, formatting, and `git diff --check` passed. Direct
+  Tester validation passed, and adversarial review reported no remaining
+  actionable findings after output-root, seed-contract, and repository-state
+  fail-open paths were closed.

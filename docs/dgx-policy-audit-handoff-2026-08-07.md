@@ -100,8 +100,9 @@ The experiment phases are:
    LRU, ARC, semantic-minmax, semantic-mean, and semantic-cuboid-mean.
 3. Chat, RAG, and mixed serving at parent request rates 2 and 8 across all five
    policies.
-4. Semantic-mean ablations for first/max, middle/max, middle/mean, decayed
-   session evidence, 1% prefetch, 5% prefetch, and capture stride 4.
+4. Semantic-mean ablations for first/max, middle/max, explicit middle/mean alpha
+   0.5, experimental middle/mean alpha 0.6, decayed session evidence, 1%
+   prefetch, 5% prefetch, and capture stride 4.
 
 Four cells run concurrently on GPUs 4–7. This reduces wall-clock time but means
 latency, CPU-tier transfer, pinned-memory, and RSS results share host resources.
@@ -116,6 +117,7 @@ Each run creates:
 ```text
 dgx_logs/policy_audit_<timestamp>/
 ├── manifest.txt
+├── repository_state.txt
 ├── unit_tests.log
 ├── leaderboard_ref0/
 ├── leaderboard_ref1/
@@ -124,24 +126,29 @@ dgx_logs/policy_audit_<timestamp>/
 ├── signal_first_max/
 ├── signal_middle_max/
 ├── signal_middle_mean/
+├── signal_middle_mean_alpha06/
 ├── session_decay8/
 ├── prefetch_001/
 ├── prefetch_005/
 ├── capture_stride4/
 ├── audit_summary.csv
+├── alpha_paired_seed_deltas.csv
 ├── audit_summary.md
 └── timing_summary.csv
 ```
 
 A sibling `policy_audit_<timestamp>.tar.gz` is also created. Per-cell server and
-driver logs remain under each variant/GPU directory. The manifest records both
-Git revisions, dirty status, a worktree-content hash, environment paths, model,
-GPU allocation, and NVIDIA device/driver information.
+driver logs remain under each variant/GPU directory. Each variant also contains
+`variant_manifest.txt` with its exact command/config, seed/GPU contract, and
+start/end semantic and vLLM repository fingerprints. The root manifests record
+the same whole-run repository state plus environment paths, model, GPU
+allocation, and NVIDIA device/driver information.
 
 The summarizer exits nonzero on missing variants/cells, errors, malformed
-metrics, non-finite values, duplicate standalone rows, or an entirely
-unpressured leaderboard arm. The shell script accumulates grid failures, still
-attempts to summarize available evidence, creates the archive, and exits
+metrics, non-finite values, duplicate standalone rows, an entirely unpressured
+leaderboard arm, config/seed provenance disagreement, or repository drift. The
+shell script atomically refuses reused output roots, accumulates grid failures,
+still attempts to summarize available evidence, creates the archive, and exits
 nonzero if any phase failed.
 
 ## How to interpret needle-v2
@@ -309,8 +316,8 @@ Prioritized remaining work after this run:
    equivalent O(candidates) batch update.
 6. **Score calibration.** Compare raw, rank-normalized, and query-normalized
    relevance without conflating scale with semantic utility.
-7. **Statistical reporting.** Add paired seed deltas, confidence intervals, and
-   explicit pass/fail gates against LRU and ARC.
+7. **Statistical reporting.** Alpha 0.5/0.6 now has seed-level paired deltas;
+   add confidence intervals and explicit pass/fail gates against LRU and ARC.
 8. **Long-soak/reset coverage.** Test repeated engine reset, abort during
    prefetch, stale completion acknowledgements, and multi-hour RSS/GC behavior.
 9. **Termination cleanup.** Add SIGINT/parent-interruption cleanup to the grid

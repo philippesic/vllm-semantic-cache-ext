@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import json
 import math
 import re
 import statistics
@@ -33,6 +34,7 @@ EXPECTED_VARIANTS = {
     "signal_first_max",
     "signal_middle_max",
     "signal_middle_mean",
+    "signal_middle_mean_alpha06",
     "session_decay8",
     "prefetch_001",
     "prefetch_005",
@@ -55,6 +57,21 @@ ABLATION_VARIANTS = EXPECTED_VARIANTS - {
 MIXED_SUBWORKLOAD_RATES = {
     "2.0": {"chat": "0.8", "rag": "0.7", "longdoc": "0.5"},
     "8.0": {"chat": "3.2", "rag": "2.8", "longdoc": "2.0"},
+}
+ALPHA_BASELINE_VARIANT = "signal_middle_mean"
+ALPHA_CANDIDATE_VARIANT = "signal_middle_mean_alpha06"
+ALPHA_COMMON_CONFIG = {
+    "probe_layer": "middle",
+    "head_aggregation": "mean",
+    "prefetch_budget_fraction": 0,
+}
+ALPHA_METRICS = {
+    "ttft_p50_ms": "lower",
+    "ttft_p99_ms": "lower",
+    "throughput_tok_s": "higher",
+    "load_bytes_delta": "context",
+    "store_bytes_delta": "context",
+    "preemptions_delta": "lower",
 }
 
 
@@ -95,6 +112,173 @@ def load_results(root: Path) -> tuple[list[dict], list[str]]:
                 )
             rows.append(row)
     return rows, errors
+
+
+def _read_variant_manifest(path: Path) -> tuple[dict[str, str], list[str]]:
+    values: dict[str, str] = {}
+    errors: list[str] = []
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as error:
+        return {}, [f"{path.parent.name}: cannot read variant manifest: {error}"]
+    for line_number, line in enumerate(lines, start=1):
+        if "=" not in line:
+            errors.append(f"{path}:{line_number}: malformed manifest line")
+            continue
+        key, value = line.split("=", 1)
+        if key in values:
+            errors.append(f"{path}:{line_number}: duplicate manifest key {key}")
+        values[key] = value
+    return values, errors
+
+
+def validate_variant_manifests(
+    root: Path, expected_seeds: set[str] | None = None
+) -> list[str]:
+    """Bind directory labels to the exact alpha configs used by the runner."""
+    errors: list[str] = []
+    manifests: dict[str, dict[str, str]] = {}
+    for variant in sorted(EXPECTED_VARIANTS):
+        path = root / variant / "variant_manifest.txt"
+        if not path.is_file():
+            errors.append(f"{variant}: missing variant_manifest.txt")
+            continue
+        values, current_errors = _read_variant_manifest(path)
+        errors.extend(current_errors)
+        manifests[variant] = values
+        if values.get("variant") != variant:
+            errors.append(
+                f"{variant}: manifest variant is {values.get('variant')!r}, expected {variant!r}"
+            )
+
+    manifest_seed_sets: dict[str, set[str]] = {}
+    for variant, values in manifests.items():
+        recorded_seeds = {
+            seed.strip() for seed in values.get("seeds", "").split(",") if seed.strip()
+        }
+        if not recorded_seeds:
+            errors.append(f"{variant}: manifest has no seeds")
+            continue
+        manifest_seed_sets[variant] = recorded_seeds
+        if expected_seeds is not None and recorded_seeds != expected_seeds:
+            errors.append(
+                f"{variant}: manifest seeds {sorted(recorded_seeds)!r} do not match "
+                f"expected seeds {sorted(expected_seeds)!r}"
+            )
+    if manifest_seed_sets:
+        seed_contracts = {frozenset(seeds) for seeds in manifest_seed_sets.values()}
+        if len(seed_contracts) > 1:
+            errors.append(
+                "variant manifests disagree on seeds: "
+                + ", ".join(
+                    f"{variant}={','.join(sorted(seeds))}"
+                    for variant, seeds in sorted(manifest_seed_sets.items())
+                )
+            )
+
+    expected_configs = {
+        ALPHA_BASELINE_VARIANT: {**ALPHA_COMMON_CONFIG, "alpha": 0.5},
+        ALPHA_CANDIDATE_VARIANT: {**ALPHA_COMMON_CONFIG, "alpha": 0.6},
+    }
+    for variant, expected_config in expected_configs.items():
+        values = manifests.get(variant)
+        if values is None:
+            continue
+        try:
+            actual_config = json.loads(values.get("extra-config", ""))
+        except json.JSONDecodeError as error:
+            errors.append(f"{variant}: invalid extra-config JSON: {error}")
+            continue
+        if actual_config != expected_config:
+            errors.append(
+                f"{variant}: extra-config {actual_config!r} does not match "
+                f"expected {expected_config!r}"
+            )
+        if values.get("policies") != "semantic-mean":
+            errors.append(f"{variant}: policies must be semantic-mean")
+        if values.get("workloads") != "needle-v2,chat,rag":
+            errors.append(f"{variant}: workloads must be needle-v2,chat,rag")
+        if values.get("request-rates") != "8.0":
+            errors.append(f"{variant}: request-rates must be 8.0")
+        if values.get("needle-reference-counts") != "1":
+            errors.append(f"{variant}: needle-reference-counts must be 1")
+
+    baseline = manifests.get(ALPHA_BASELINE_VARIANT)
+    candidate = manifests.get(ALPHA_CANDIDATE_VARIANT)
+    if baseline is not None and candidate is not None:
+        paired_fields = (
+            "policies",
+            "workloads",
+            "request-rates",
+            "needle-reference-counts",
+            "num-prompts",
+            "target-duration-s",
+            "seeds",
+            "gpus",
+        )
+        for field in paired_fields:
+            if baseline.get(field) != candidate.get(field):
+                errors.append(
+                    f"alpha variants differ in {field}: "
+                    f"{baseline.get(field)!r} != {candidate.get(field)!r}"
+                )
+    return errors
+
+
+def validate_repository_state(
+    root: Path, *, require_summary_end: bool = True
+) -> list[str]:
+    """Reject results produced while either repository changed underneath them."""
+    state_path = root / "repository_state.txt"
+    if not state_path.is_file():
+        return ["missing repository_state.txt"]
+    root_state, errors = _read_variant_manifest(state_path)
+    fields = (
+        "semantic_revision",
+        "semantic_state",
+        "vllm_revision",
+        "vllm_state",
+    )
+    for field in fields:
+        start = root_state.get(f"{field}_start", "")
+        end = root_state.get(f"{field}_end", "")
+        if not start or not end:
+            errors.append(f"repository_state.txt: missing {field} start/end")
+        elif start != end:
+            errors.append(f"repository state drift: {field} {start!r} != {end!r}")
+        summary_end = root_state.get(f"{field}_summary_end")
+        if summary_end is None:
+            if require_summary_end:
+                errors.append(f"repository_state.txt: missing {field}_summary_end")
+        elif start != summary_end:
+            errors.append(
+                f"repository state drift during summary: {field} "
+                f"{start!r} != {summary_end!r}"
+            )
+
+    for variant in sorted(EXPECTED_VARIANTS):
+        path = root / variant / "variant_manifest.txt"
+        if not path.is_file():
+            continue
+        values, current_errors = _read_variant_manifest(path)
+        errors.extend(current_errors)
+        for field in fields:
+            start = values.get(f"{field}_start", "")
+            end = values.get(f"{field}_end", "")
+            expected = root_state.get(f"{field}_start", "")
+            if not start or not end:
+                errors.append(f"{variant}: missing {field} start/end")
+            elif start != end:
+                errors.append(
+                    f"{variant}: repository state drift for {field}: "
+                    f"{start!r} != {end!r}"
+                )
+            elif expected and start != expected:
+                errors.append(
+                    f"{variant}: {field} {start!r} does not match audit "
+                    f"start {expected!r}"
+                )
+    return errors
 
 
 def validate_matrix(rows: list[dict], expected_seeds: set[str]) -> list[str]:
@@ -321,6 +505,108 @@ def aggregate(rows: list[dict]) -> list[dict]:
     return output
 
 
+def alpha_pair_rows(rows: list[dict]) -> list[dict]:
+    """Return seed-level alpha=.5/.6 comparisons without hiding outcomes."""
+
+    def identity(row: dict) -> tuple[str, ...]:
+        return tuple(
+            row.get(field, "")
+            for field in (
+                "seed",
+                "workload",
+                "sub_workload",
+                "request_rate",
+                "parent_request_rate",
+                "reference_count",
+            )
+        )
+
+    successful = [row for row in rows if not (row.get("error") or "").strip()]
+    baseline = {
+        identity(row): row
+        for row in successful
+        if row.get("variant") == ALPHA_BASELINE_VARIANT
+    }
+    candidate = {
+        identity(row): row
+        for row in successful
+        if row.get("variant") == ALPHA_CANDIDATE_VARIANT
+    }
+
+    output: list[dict] = []
+
+    def append(
+        key: tuple[str, ...],
+        metric: str,
+        direction: str,
+        baseline_value: str | float,
+        candidate_value: str | float,
+        delta: str | float,
+    ) -> None:
+        output.append(
+            {
+                "seed": key[0],
+                "workload": key[1],
+                "sub_workload": key[2],
+                "request_rate": key[3],
+                "parent_request_rate": key[4],
+                "reference_count": key[5],
+                "metric": metric,
+                "preferred_direction": direction,
+                "alpha_05": baseline_value,
+                "alpha_06": candidate_value,
+                "delta_alpha06_minus_alpha05": delta,
+            }
+        )
+
+    for key in sorted(baseline.keys() & candidate.keys()):
+        baseline_row = baseline[key]
+        candidate_row = candidate[key]
+        if key[1] == "needle-v2":
+            baseline_outcome = baseline_row.get("needle_outcome", "")
+            candidate_outcome = candidate_row.get("needle_outcome", "")
+            append(
+                key,
+                "needle_outcome",
+                "categorical",
+                baseline_outcome,
+                candidate_outcome,
+                "",
+            )
+            pressured = {"hit", "partial", "miss"}
+            if baseline_outcome in pressured and candidate_outcome in pressured:
+                for metric, successful_outcomes in (
+                    ("needle_full_hit", {"hit"}),
+                    ("needle_any_load", {"hit", "partial"}),
+                ):
+                    baseline_value = float(baseline_outcome in successful_outcomes)
+                    candidate_value = float(candidate_outcome in successful_outcomes)
+                    append(
+                        key,
+                        metric,
+                        "higher",
+                        baseline_value,
+                        candidate_value,
+                        candidate_value - baseline_value,
+                    )
+            continue
+
+        for metric, direction in ALPHA_METRICS.items():
+            baseline_value = _number(baseline_row.get(metric))
+            candidate_value = _number(candidate_row.get(metric))
+            if baseline_value is None or candidate_value is None:
+                continue
+            append(
+                key,
+                metric,
+                direction,
+                baseline_value,
+                candidate_value,
+                candidate_value - baseline_value,
+            )
+    return output
+
+
 def aggregate_timings(root: Path) -> list[dict]:
     """Use each process/log's last cumulative timing snapshot."""
     latest: dict[tuple, tuple[int, float]] = {}
@@ -370,7 +656,11 @@ def aggregate_timings(root: Path) -> list[dict]:
 
 
 def write_summary(
-    root: Path, summaries: list[dict], timings: list[dict], errors: list[str]
+    root: Path,
+    summaries: list[dict],
+    timings: list[dict],
+    alpha_pairs: list[dict],
+    errors: list[str],
 ) -> None:
     csv_path = root / "audit_summary.csv"
     if summaries:
@@ -383,6 +673,11 @@ def write_summary(
             writer = csv.DictWriter(handle, fieldnames=list(timings[0]))
             writer.writeheader()
             writer.writerows(timings)
+    if alpha_pairs:
+        with (root / "alpha_paired_seed_deltas.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(alpha_pairs[0]))
+            writer.writeheader()
+            writer.writerows(alpha_pairs)
 
     markdown = ["# DGX policy audit summary", ""]
     if errors:
@@ -390,9 +685,11 @@ def write_summary(
         markdown += [f"- {error}" for error in errors]
         markdown.append("")
     markdown += [
-        "| Variant | Policy | Workload | Rate/ref | Runs | Needle H/P/M/NP | "
-        "Full-hit LB | Any-load rate | TTFT p50 ms | TTFT p99 ms | Tok/s | "
-        "Preemptions |",
+        (
+            "| Variant | Policy | Workload | Rate/ref | Runs | Needle H/P/M/NP | "
+            "Full-hit LB | Any-load rate | TTFT p50 ms | TTFT p99 ms | Tok/s | "
+            "Preemptions |"
+        ),
         "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in summaries:
@@ -418,6 +715,74 @@ def write_summary(
             f"{_display(row, 'mean_throughput_tok_s')} | "
             f"{_display(row, 'mean_preemptions_delta')} |"
         )
+    alpha_outcomes = [row for row in alpha_pairs if row["metric"] == "needle_outcome"]
+    if alpha_outcomes:
+        markdown += [
+            "",
+            "## Paired alpha 0.5 vs 0.6 seed outcomes",
+            "",
+            (
+                "Alpha 0.6 remains experimental. Empty numeric pairs indicate that "
+                "at least one seed was not pressured; concurrent-grid performance "
+                "deltas remain provisional pending isolated one-GPU confirmation."
+            ),
+            "",
+            "| Seed | Workload | Rate/ref | Alpha 0.5 | Alpha 0.6 |",
+            "|---:|---|---:|---|---|",
+        ]
+        for row in alpha_outcomes:
+            rate_ref = (
+                row["parent_request_rate"]
+                or row["request_rate"]
+                or row["reference_count"]
+                or "-"
+            )
+            markdown.append(
+                f"| {row['seed']} | {row['workload']} | {rate_ref} | "
+                f"{row['alpha_05']} | {row['alpha_06']} |"
+            )
+
+    numeric_alpha_pairs = [
+        row for row in alpha_pairs if row["delta_alpha06_minus_alpha05"] != ""
+    ]
+    if numeric_alpha_pairs:
+        grouped_pairs: dict[tuple[str, ...], list[dict]] = defaultdict(list)
+        for row in numeric_alpha_pairs:
+            key = (
+                row["workload"],
+                row["sub_workload"],
+                row["request_rate"],
+                row["parent_request_rate"],
+                row["reference_count"],
+                row["metric"],
+                row["preferred_direction"],
+            )
+            grouped_pairs[key].append(row)
+        markdown += [
+            "",
+            "### Paired alpha aggregate deltas",
+            "",
+            (
+                "Deltas are alpha 0.6 minus alpha 0.5. Positive is preferred only "
+                "for `higher` metrics; negative is preferred only for `lower` "
+                "metrics. Byte deltas are context, not wins."
+            ),
+            "",
+            (
+                "| Workload | Rate/ref | Metric | Direction | Pairs | Alpha 0.5 | "
+                "Alpha 0.6 | Mean delta |"
+            ),
+            "|---|---:|---|---|---:|---:|---:|---:|",
+        ]
+        for key, group in sorted(grouped_pairs.items()):
+            rate_ref = key[3] or key[2] or key[4] or "-"
+            markdown.append(
+                f"| {key[0]} | {rate_ref} | {key[5]} | {key[6]} | "
+                f"{len(group)} | "
+                f"{statistics.fmean(float(row['alpha_05']) for row in group):.4f} | "
+                f"{statistics.fmean(float(row['alpha_06']) for row in group):.4f} | "
+                f"{statistics.fmean(float(row['delta_alpha06_minus_alpha05']) for row in group):.4f} |"
+            )
     if timings:
         markdown += [
             "",
@@ -439,13 +804,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
     parser.add_argument("--allow-errors", action="store_true")
+    parser.add_argument(
+        "--pre-summary",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--expected-seeds", default="1,2,3")
     args = parser.parse_args()
     rows, errors = load_results(args.root)
-    errors.extend(validate_matrix(rows, set(args.expected_seeds.split(","))))
+    expected_seeds = set(args.expected_seeds.split(","))
+    errors.extend(validate_matrix(rows, expected_seeds))
+    errors.extend(validate_variant_manifests(args.root, expected_seeds))
+    errors.extend(
+        validate_repository_state(args.root, require_summary_end=not args.pre_summary)
+    )
     summaries = aggregate(rows)
     timings = aggregate_timings(args.root)
-    write_summary(args.root, summaries, timings, errors)
+    alpha_pairs = alpha_pair_rows(rows)
+    write_summary(args.root, summaries, timings, alpha_pairs, errors)
     print(f"summarized {len(rows)} rows into {args.root / 'audit_summary.md'}")
     if errors and not args.allow_errors:
         raise SystemExit(f"audit validation failed with {len(errors)} error(s)")

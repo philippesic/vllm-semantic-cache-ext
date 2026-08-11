@@ -85,8 +85,9 @@ actionable findings.
 
 ## Repository and environment state at close
 
-- Extension repository: `7b5d79697823368f1aef3cc85ae35db6917ebb0a`
-- Extension branch: `master`, equal to `origin/master`
+- Audit implementation baseline: `7b5d79697823368f1aef3cc85ae35db6917ebb0a`
+- Extension branch: `master`, with the committed session-close handoff following
+  that baseline and equal to `origin/master` at stop
 - Sibling vLLM revision: `dc1be79031d948d7a18c37600881e45ca708d913`
 - Local Python: `3.12.13`
 - Local PyTorch: `2.13.0`

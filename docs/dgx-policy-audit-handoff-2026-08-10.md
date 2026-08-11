@@ -189,8 +189,8 @@ use the DGX extension checkout and require the committed revision before launch:
 ```bash
 cd /raid/ppesic/tmp/vllm-semantic-cache-ext
 git pull --ff-only
-test "$(git rev-parse HEAD)" = \
-  "7b5d79697823368f1aef3cc85ae35db6917ebb0a"
+git merge-base --is-ancestor \
+  "7b5d79697823368f1aef3cc85ae35db6917ebb0a" HEAD
 ./dgx_policy_audit.sh
 ```
 

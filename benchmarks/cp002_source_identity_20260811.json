@@ -1,0 +1,18 @@
+{
+  "evidence_producer_sha256": "13e338f042ecc93d165449204aba1c52e5606da98fd523790b8cd62b4da07193",
+  "extension_archive_path": "/home/philip/semantic-cache-agent/wsl-session-20260810/artifacts/extension-646fea0.tar.gz",
+  "extension_archive_sha256": "2e9b0991d4577d46f51d7f0f562b3da8522af6a95a5f331914520c6c2eed7a90",
+  "extension_revision": "646fea09139a5a4112a650967acc0b4394ac9c6f",
+  "extension_source_root": "/home/philip/semantic-cache-agent/wsl-session-20260810/src/extension",
+  "extension_tree_sha256": "dac69d0ac08ec6099d0f6546a743899936276e1519d9fed6d59a8c60ffca5a8a",
+  "model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "model_revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+  "required_wsl_pin_memory": "1",
+  "schema": "cp002-source-identity-v2",
+  "source_manifest_sha256": "f15b6b0640088a3a4ccf98b2ea151dc1c2ae3ee8a12c55842fbc8d6a6677e78c",
+  "vllm_archive_path": "/home/philip/semantic-cache-agent/wsl-session-20260810/artifacts/vllm-dc1be790.tar.gz",
+  "vllm_archive_sha256": "5a091d0fd86be7122aeedddcd58db84885a1f47a1c0d76110bdb6f474d938da5",
+  "vllm_revision": "dc1be79031d948d7a18c37600881e45ca708d913",
+  "vllm_source_root": "/home/philip/semantic-cache-agent/wsl-session-20260810/src/vllm",
+  "vllm_tree_sha256": "bdb9b4cb82c661ab1ececea44fd23bd341a220764d84cc1859b374338de498ea"
+}
